@@ -78,6 +78,37 @@ chart decoration. It:
 - **Not a charting platform.** It renders enough chart to show the pattern; it does not compete
   with general-purpose charting.
 
+### 1.6 Platform decision: TradingView / Pine Script v6
+
+Phase 1 (§11) ships as a **TradingView Pine Script v6 `strategy()`**, run on TradingView's own
+charts and data. This was chosen over a standalone web build because it reuses an existing feed,
+chart, and — critically for §12 — an existing historical **Strategy Tester** to validate the
+engine against real bars, rather than requiring a bespoke backtest harness before anything can be
+proven. Chosen over a plain `indicator()` because a `strategy()` is what makes §12's win-rate /
+profit-factor / drawdown numbers real, not asserted: TradingView computes them from the script's
+own `strategy.entry` / `strategy.exit` calls replayed across history.
+
+This is a real constraint, not a free upgrade, and it reshapes parts of the spec:
+
+| Spec section | On TradingView | Disposition |
+|---|---|---|
+| §3 normative ratios, §6 PRZ, §7.1–7.6 risk/stop/target rules | Implement exactly as specified — pure arithmetic, no platform dependency | **In scope, v1** |
+| §5.2 anti-repainting (D1–D5) | `ta.pivothigh(depth, depth)` / `ta.pivotlow(depth, depth)` are non-repainting by construction — a value is only ever returned `depth` bars after the pivot bar, once confirmed | **In scope, v1** — this is the mechanism, not a reimplementation of it |
+| §12 historical validation | Native: apply the script to a symbol/timeframe, open the **Strategy Tester** tab | **In scope, v1** — see §11.5 below |
+| §5.3 candidate enumeration | One chart = one instrument = one timeframe. A watchlist scan across 50 instruments (§12's engineering target) is not something one Pine script does | **Deferred.** Phase 1 ships as a per-chart script; a cross-symbol scanner is a separate TradingView Screener build or an external service, out of scope here |
+| §7.7 portfolio-level limits (correlation clusters, daily loss cap, max concurrent risk) | Pine has no state that persists *across* symbols or *across* sessions independent of the chart it's running on | **Deferred to a companion service.** The ratio/PRZ/risk engine (§3–§7.6) is portable logic; portfolio aggregation needs a backend that Pine cannot provide. Noted as a gap, not silently dropped |
+| §8 manual plotting with live recompute | TradingView's manual Fib/XABCD drawing tools do not talk to a script's validation logic | **Deferred.** v1's validation is scanner-only; a manual mode would need a second, browser-hosted build reusing the same ratio module |
+| §9 UI (status states, portfolio heat panel, order ticket) | Pine draws on-chart (lines, boxes, labels) and posts `alertcondition()`/`alert()` text; it does not render a side panel | **Simplified.** Status is conveyed via plot color, box label text, and alert payload — not the full §9.1 layout |
+
+**Tolerance implementation note.** §2.4 defines tolerance as a price width (`tolerance_pct × |A−X|`)
+applied to each contributor price. The Pine v1 script applies `tolerance_pct` directly in **ratio
+space** to every constraint window (B, C, BC-projection, AB=CD, D) for implementation simplicity.
+This is the convention essentially all public Pine harmonic scripts use, and is *not* identical to
+§2.4's leg-relative price tolerance — it is documented here as a known v1 simplification, not a
+silent deviation. The §6.2 PRZ envelope itself, however, **is** computed the spec-faithful way: the
+three contributor prices (D-of-XA, BC projection, AB=CD) are converted to prices first, and a single
+`tolerance_pct × |A−X|` price band is applied around their min/max.
+
 ---
 
 ## 2. Measurement conventions
@@ -709,20 +740,54 @@ The confirmed scope — four asset classes plus both detection modes — is wide
 the primary delivery risk.** The phasing below sequences it so the engine is proven on the
 cheapest data before market-specific complexity is added.
 
-### Phase 1 — Engine + Crypto (foundation)
+### Phase 1 — Engine + Crypto, on TradingView (foundation)
 
 Crypto first because the feed is free and open, it runs 24/7 with no session or gap logic, and
-sizing is fractional — the fewest confounds while the core engine is stabilised.
+sizing is fractional — the fewest confounds while the core engine is stabilised. Built as the
+Pine Script v6 `strategy()` described in §1.6, run against TradingView's own crypto data.
 
-- Pattern definitions §3 as data; ratio evaluator; structural rules
-- Pivot detection with the anti-repainting guarantee and its replay test (§5.2)
-- PRZ convergence, risk plan, all gates
-- **Manual plotting mode** — ships first, since it is the scanner's test harness (§8.2 M1)
-- Scanner across a crypto watchlist; chart, PRZ matrix, risk panel; alerts
-- Gartley, Bat, Butterfly, Crab
+- Pattern definitions §3 as data (a Pine `PatternDef` table); ratio evaluator; structural rules
+- Pivot detection via confirmed `ta.pivothigh`/`ta.pivotlow` — the anti-repainting guarantee is
+  structural, not bolted on (§5.2, §1.6)
+- PRZ convergence (§6), risk plan (§7.1–7.6), all gates — implemented exactly as specified
+- Gartley, Bat, Butterfly, Crab, on one symbol/timeframe per chart
+- On-chart polygon, PRZ box, stop/TP lines; `alertcondition()` for PRZ entry and confirmed entry
+- **Scanner-only.** Manual plotting (§8) and the cross-symbol watchlist scanner (§5.3) are the
+  parts of this phase's original ambition that Pine cannot provide (§1.6) — deferred, not silently
+  dropped, to a browser-hosted build in a later phase
 
-**Exit criteria:** replay test passes with zero disappearances; manual and scanner agree
-numerically on 20 hand-checked historical patterns; both §10 case studies reproduce exactly.
+**Exit criteria:** the §11.5 historical validation protocol passes on Bar Replay (no repainting)
+and reproduces both §10 case studies within one tick; the Strategy Tester's trade list shows zero
+trades with a stop inside their own PRZ and zero trades below the configured R:R floor.
+
+### 11.5 Historical validation protocol (Pine Script v1)
+
+Concrete, repeatable steps for validating `harmonic_prz_scanner.pine` (Appendix B) against real
+history on TradingView, rather than trusting the script on faith.
+
+1. **Non-repainting check.** Apply the script to a liquid chart (e.g. BTCUSDT, H1). Open **Bar
+   Replay**, step forward through a period where the script draws a pattern polygon and PRZ box.
+   **Pass condition:** once a polygon is drawn, it never disappears or moves on a later bar — it
+   only ever transitions to `INVALIDATED`/`EXPIRED` styling (§6.4). This directly exercises D3.
+2. **Case-study reproduction.** Load XAG/USD (or the closest available silver CFD/futures symbol)
+   on a daily chart spanning the corrected Case Study 1 dates (§10.1). Confirm the script's plotted
+   X/A/B/C prices and PRZ band match §10.1's corrected figures (B ≈ 61.97, D-zone around 66.10)
+   within one tick — not the source brief's incorrect 61.10 / 64.88–65.21. Repeat for the BTC/USDT
+   replacement (§10.2).
+3. **Strategy Tester read.** With the script running as a `strategy()`, open TradingView's
+   **Strategy Tester** panel → **Performance Summary** for net profit, win rate, and profit factor;
+   **List of Trades** for entry/exit prices per trade, cross-checked against the on-chart PRZ/stop/
+   TP levels for a handful of trades by hand.
+   **This is decision-support-only historical validation, not a claim of a tradeable edge:** default
+   inputs are unoptimized, no commission/slippage model is configured out of the box (add both under
+   Strategy Properties before drawing any conclusion — §7.2's spread/slippage warning applies here
+   too), and sample sizes on a single symbol/timeframe will usually fall short of §12's 100-trade
+   research bar. Its purpose is to prove the **arithmetic and gating logic behave as specified**
+   (G1–G4), not to certify profitability.
+4. **Gate verification.** Confirm in the trade list that no trade shows a stop price inside the PRZ
+   band it entered from (§7.1 hard invariant), and that every trade's realized TP2 distance divided
+   by its risk is ≥ `rrMin` (default 2.0, §7.6) — a trade violating either is a script defect, not a
+   market outcome.
 
 ### Phase 2 — Forex + Metals
 

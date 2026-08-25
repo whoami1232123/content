@@ -1,0 +1,275 @@
+// ============================================================================
+// Harmonic PRZ Matrix Scanner — Gartley / Bat / Butterfly / Crab
+// TradingView Pine Script v6 STRATEGY (not a plain indicator)
+//
+// Reference implementation for PRD.md §1.6, §3, §5–§7, §11 (Phase 1).
+// Every ratio, invalidation, stop and target below is taken verbatim from the
+// PRD's corrected §3.2 table — NOT from the original design brief, which
+// contained the bugs this script deliberately avoids:
+//   - no BC projection / AB=CD checks              -> added here (§3.2)
+//   - Butterfly/Crab stop = own PRZ edge (0 buffer) -> stopR extends past it
+//   - "1.130 XA" stop applied to all patterns        -> stop ratio is per-pattern
+//   - targets measured off the CD leg                -> targets are on the AD leg
+//   - blind limit order at D                         -> requires an engulfing
+//                                                        confirmation inside the
+//                                                        zone before any entry
+//
+// WHY A strategy() AND NOT AN indicator()
+//   A strategy() is what makes historical validation real rather than asserted:
+//   TradingView's own Strategy Tester replays this script's strategy.entry /
+//   strategy.exit calls across every historical bar on whatever chart you load
+//   it onto, and reports win rate, profit factor, drawdown and a full trade
+//   list computed from THIS code, not from a claim in a document.
+//
+// HOW TO HISTORICALLY VALIDATE THIS SCRIPT (PRD §11.5)
+//   1. Non-repainting check: apply to a liquid chart (e.g. BTCUSDT, 1H), open
+//      Bar Replay, step forward. A drawn pattern polygon/PRZ box must NEVER
+//      disappear or move on a later bar — only ever turn stale/invalidated.
+//      This is guaranteed structurally here: ta.pivothigh/pivotlow only ever
+//      return a value `pivotDepth` bars AFTER the pivot bar, once confirmed.
+//   2. Case-study reproduction: load XAG/USD on a daily chart around the
+//      corrected PRD §10.1 dates. The script's plotted B should print near
+//      61.97 (78.6% of XA), and the PRZ band near 66.10 (1.270 XA) — NOT the
+//      source brief's incorrect 61.10 / 64.88-65.21. See the worked check at
+//      the bottom of this file.
+//   3. Strategy Tester: open the "Strategy Tester" tab -> Performance Summary
+//      for net profit / win rate / profit factor, and List of Trades to
+//      cross-check individual fills against the on-chart PRZ/stop/TP levels.
+//      Set commissionPct/slippageTicks below to something realistic before
+//      drawing ANY conclusion from the numbers (PRD §7.2, §11.5 step 3) — the
+//      defaults are 0, which flatters every strategy.
+//   4. Gate verification: in the trade list, confirm no trade's stop sits
+//      inside the PRZ it entered from, and every trade's realized R:R to TP2
+//      is >= rrMin. A violation is a script defect, not a market outcome.
+//
+// SCOPE (PRD §1.6, §11 Phase 1): Gartley, Bat, Butterfly, Crab. One symbol,
+// one timeframe, per chart — this is a scanner for the chart it's applied to,
+// not the multi-symbol watchlist scanner or the manual-plotting mode from the
+// PRD (§5.3, §8) — Pine cannot provide either; see §1.6's disposition table.
+// Shark (5-point O-X-A-B-C, §3.3) is Phase 2 and not implemented here.
+//
+// TOLERANCE NOTE (PRD §1.6 "Tolerance implementation note"): tolPct below is
+// applied directly in ratio space to every constraint window (B, C, BC-proj,
+// AB=CD, D) for implementation simplicity — the common convention in public
+// Pine harmonic scripts. The PRZ envelope itself IS computed the spec-faithful
+// way: three contributor prices, then a single price-width tolerance band
+// (tolPct% of |A-X|) around their min/max (§6.2).
+// ============================================================================
+
+//@version=6
+strategy("Harmonic PRZ Matrix — Gartley/Bat/Butterfly/Crab",
+    shorttitle = "Harmonic PRZ",
+    overlay = true,
+    initial_capital = 10000,
+    default_qty_type = strategy.fixed,
+    default_qty_value = 1,
+    pyramiding = 0,
+    calc_on_every_tick = false,
+    process_orders_on_close = true,
+    commission_type = strategy.commission.percent,
+    commission_value = input.float(0.05, "Commission % per fill (§7.2, §11.5)", minval = 0.0, step = 0.01, group = "Backtest realism"),
+    slippage = input.int(2, "Slippage (ticks, §7.2, §11.5)", minval = 0, group = "Backtest realism"),
+    max_lines_count = 300, max_boxes_count = 300, max_labels_count = 300)
+
+// ---------------------------------------------------------------- Inputs ---
+grpDet = "Detection (§5)"
+pivotDepth = input.int(5, "Pivot confirmation depth (bars each side)", minval = 2, group = grpDet, tooltip = "A pivot only becomes visible pivotDepth bars after it forms — this is what makes detection non-repainting (§5.2 D1/D2).")
+maxPivots  = input.int(60, "Max stored zig-zag points", minval = 12, group = grpDet)
+
+grpPat = "Patterns (§3.2)"
+useGartley   = input.bool(true, "Gartley",   group = grpPat)
+useBat       = input.bool(true, "Bat",       group = grpPat)
+useButterfly = input.bool(true, "Butterfly", group = grpPat)
+useCrab      = input.bool(true, "Crab",      group = grpPat)
+
+grpRisk = "Tolerance & Risk (§2.4, §7)"
+tolPct        = input.float(2.0, "Ratio tolerance (%, ratio-space — see file header)", minval = 0.1, step = 0.1, group = grpRisk)
+rrMin         = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5, step = 0.1, group = grpRisk)
+stopBufA      = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio (added to stopR)", minval = 0.0, step = 0.01, group = grpRisk)
+requireConfirm = input.bool(true, "Require engulfing confirmation inside the PRZ before entry (§7.4)", group = grpRisk)
+riskPct       = input.float(1.0, "Risk % of equity per trade (§7.5)", minval = 0.1, step = 0.1, group = grpRisk)
+
+// ----------------------------------------------------------------- Types ---
+type Pivot
+    float price
+    int   idx
+    bool  isHigh
+
+type PatternDef
+    string name
+    float  bLo
+    float  bHi
+    float  cLo
+    float  cHi
+    float  bcLo
+    float  bcHi
+    float  cdLo
+    float  cdHi
+    float  dLo
+    float  dHi
+    float  invalidR
+    float  stopR
+    color  col
+
+// -------------------------------------------------------------- Helpers ---
+inWindow(float val, float lo, float hi, float tol) =>
+    val >= lo - tol and val <= hi + tol
+
+// Confirmed, non-repainting zig-zag: only ever appends/replaces using
+// ta.pivothigh/pivotlow output, which itself only resolves pivotDepth bars
+// after the fact (§5.2 D1). Same-direction pivots collapse to the more
+// extreme one; alternating pivots append, keeping X-A-B-C-D strictly
+// alternating (§3.1 S1).
+addPivot(float price, int idx, bool isHigh) =>
+    n = array.size(zz)
+    if n == 0
+        array.push(zz, Pivot.new(price, idx, isHigh))
+    else
+        last = array.get(zz, n - 1)
+        if last.isHigh == isHigh
+            if (isHigh and price > last.price) or (not isHigh and price < last.price)
+                array.set(zz, n - 1, Pivot.new(price, idx, isHigh))
+        else
+            array.push(zz, Pivot.new(price, idx, isHigh))
+    if array.size(zz) > maxPivots
+        array.shift(zz)
+
+// ------------------------------------------------------------ Persisted ---
+var Pivot[]      zz      = array.new<Pivot>()
+var PatternDef[] defs    = array.new<PatternDef>()
+var int[]        lastSigC = array.new<int>()
+
+if barstate.isfirst
+    if useGartley
+        array.push(defs, PatternDef.new("Gartley",   0.618, 0.618, 0.382, 0.886, 1.130, 1.618, 1.000, 1.000, 0.786, 0.786, 1.000, 1.050, color.new(color.blue, 0)))
+    if useBat
+        array.push(defs, PatternDef.new("Bat",       0.382, 0.500, 0.382, 0.886, 1.618, 2.618, 1.270, 1.618, 0.886, 0.886, 1.000, 1.050, color.new(color.purple, 0)))
+    if useButterfly
+        array.push(defs, PatternDef.new("Butterfly", 0.786, 0.786, 0.382, 0.886, 1.618, 2.240, 1.270, 1.618, 1.270, 1.618, 1.618, 1.750, color.new(color.orange, 0)))
+    if useCrab
+        array.push(defs, PatternDef.new("Crab",      0.382, 0.618, 0.382, 0.886, 2.240, 3.618, 1.618, 1.618, 1.618, 1.618, 1.618, 1.902, color.new(color.red, 0)))
+    for i = 0 to array.size(defs) - 1
+        array.push(lastSigC, -1)
+
+// ---------------------------------------------------------- Pivot feed  ---
+ph = ta.pivothigh(pivotDepth, pivotDepth)
+pl = ta.pivotlow(pivotDepth, pivotDepth)
+
+if not na(ph)
+    addPivot(ph, bar_index - pivotDepth, true)
+if not na(pl)
+    addPivot(pl, bar_index - pivotDepth, false)
+
+// alertcondition needs a plain series computed unconditionally every bar
+var bool przActiveThisBar = false
+przActiveThisBar := false
+
+// --------------------------------------------------- Candidate scanning ---
+if array.size(zz) >= 4 and array.size(defs) > 0
+    n = array.size(zz)
+    X = array.get(zz, n - 4)
+    A = array.get(zz, n - 3)
+    B = array.get(zz, n - 2)
+    C = array.get(zz, n - 1)
+
+    xaLeg = A.price - X.price          // §2.1 P(A,X,r) = A + r*(X-A); sign of this leg carries direction
+    abLeg = A.price - B.price
+    bcLeg = C.price - B.price
+
+    if xaLeg != 0 and abLeg != 0 and bcLeg != 0
+        isBullish  = xaLeg > 0          // A>X: XA rises -> D projects down -> long at D (§2.3)
+        dTestPrice = isBullish ? low : high
+
+        // Only B and C are gated here (§2.2): both are fixed once C confirms and don't
+        // depend on the still-forming D. BC-projection, AB=CD and the D-of-XA ratio are
+        // NOT re-tested against dTestPrice here — instead the PRZ envelope below converts
+        // each of their ratio windows directly into contributor PRICES (§6.1/§6.2), and
+        // membership in the resulting union interval is what gates D. That is the
+        // spec-faithful PRZ definition: a convergence band, not three independent checks
+        // that all have to pass on the same live D estimate.
+        bRatio = abLeg / xaLeg                              // §2.2 B retracement of XA
+        cRatio = (C.price - B.price) / abLeg                // §2.2 C retracement of AB
+
+        validSide = bRatio > 0 and cRatio > 0
+
+        for i = 0 to array.size(defs) - 1
+            pd = array.get(defs, i)
+
+            shapeOk = validSide and inWindow(bRatio, pd.bLo, pd.bHi, tolPct / 100) and inWindow(cRatio, pd.cLo, pd.cHi, tolPct / 100)
+
+            if shapeOk
+                // §6.1/§6.2 — PRZ envelope from three contributors, spec-faithful price tolerance
+                pXAlo = A.price + pd.dLo * (X.price - A.price)
+                pXAhi = A.price + pd.dHi * (X.price - A.price)
+                pBClo = C.price - pd.bcLo * bcLeg
+                pBChi = C.price - pd.bcHi * bcLeg
+                pCDlo = C.price - pd.cdLo * abLeg
+                pCDhi = C.price - pd.cdHi * abLeg
+                tolPrice = (tolPct / 100) * math.abs(xaLeg)
+
+                envLo = math.min(math.min(math.min(pXAlo, pXAhi), math.min(pBClo, pBChi)), math.min(pCDlo, pCDhi)) - tolPrice
+                envHi = math.max(math.max(math.max(pXAlo, pXAhi), math.max(pBClo, pBChi)), math.max(pCDlo, pCDhi)) + tolPrice
+
+                invalidPrice = A.price + pd.invalidR * (X.price - A.price)
+                invalidBreached = isBullish ? dTestPrice < invalidPrice : dTestPrice > invalidPrice
+
+                inZone = dTestPrice >= math.min(envLo, envHi) and dTestPrice <= math.max(envLo, envHi)
+
+                if inZone and not invalidBreached
+                    przActiveThisBar := true
+                    box.new(C.idx, math.max(envLo, envHi), bar_index, math.min(envLo, envHi), xloc = xloc.bar_index, bgcolor = color.new(pd.col, 88), border_color = color.new(pd.col, 40), border_width = 1)
+
+                    bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+                    bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+                    confirmed = not requireConfirm or (isBullish ? bullEngulf : bearEngulf)
+
+                    if confirmed and array.get(lastSigC, i) != C.idx
+                        // §7.1 — stop ratio is per-pattern (from pd.stopR), never per trading-style
+                        stopPrice = A.price + (pd.stopR + stopBufA) * (X.price - A.price)
+                        entryPrice = dTestPrice
+                        adLeg = A.price - entryPrice
+                        tp1 = entryPrice + 0.382 * adLeg     // §7.3 — targets on the AD leg, not CD
+                        tp2 = entryPrice + 0.618 * adLeg
+                        risk = math.abs(entryPrice - stopPrice)
+                        rr2 = risk > 0 ? math.abs(tp2 - entryPrice) / risk : 0.0
+
+                        if risk > 0 and rr2 >= rrMin        // §7.6 — hard R:R gate
+                            array.set(lastSigC, i, C.idx)
+                            qty = (strategy.equity * riskPct / 100) / risk
+                            entryId = pd.name + "_" + str.tostring(C.idx)
+
+                            if isBullish
+                                strategy.entry(entryId, strategy.long, qty = qty)
+                            else
+                                strategy.entry(entryId, strategy.short, qty = qty)
+                            strategy.exit(entryId + "_x1", from_entry = entryId, stop = stopPrice, limit = tp1, qty_percent = 50)
+                            strategy.exit(entryId + "_x2", from_entry = entryId, stop = stopPrice, limit = tp2, qty_percent = 50)
+
+                            line.new(X.idx, X.price, A.idx, A.price, xloc = xloc.bar_index, color = pd.col, width = 2)
+                            line.new(A.idx, A.price, B.idx, B.price, xloc = xloc.bar_index, color = pd.col, width = 2)
+                            line.new(B.idx, B.price, C.idx, C.price, xloc = xloc.bar_index, color = pd.col, width = 2)
+                            line.new(C.idx, C.price, bar_index, entryPrice, xloc = xloc.bar_index, color = pd.col, width = 2)
+
+                            dirTxt = isBullish ? "LONG" : "SHORT"
+                            lbl = pd.name + " " + dirTxt + "  R:R " + str.tostring(rr2, "#.##")
+                            label.new(bar_index, entryPrice, text = lbl, xloc = xloc.bar_index, style = isBullish ? label.style_label_up : label.style_label_down, color = pd.col, textcolor = color.white, size = size.small)
+
+                            alert(pd.name + " " + dirTxt + " confirmed — entry " + str.tostring(entryPrice) + " stop " + str.tostring(stopPrice) + " TP2 " + str.tostring(tp2) + " R:R " + str.tostring(rr2, "#.##"), alert.freq_once_per_bar_close)
+
+alertcondition(przActiveThisBar, title = "PRZ Active", message = "Price entered a harmonic PRZ zone on {{ticker}} {{interval}}")
+
+// ============================================================================
+// WORKED CHECKS — PRD §10, reproduced here so the arithmetic above is
+// auditable by hand against the same numbers the PRD verified in Python.
+//
+// Case Study 1 (corrected) — XAG/USD Bearish Butterfly
+//   X=63.80  A=55.27  (xaLeg = A-X = -8.53, isBullish = false)
+//   B should print near 61.97 -> bRatio = (A-B)/xaLeg = (55.27-61.97)/-8.53 = 0.786  [target 0.786]
+//   D-of-XA envelope center (1.270) -> A + 1.270*(X-A) = 55.27 + 1.270*8.53 = 66.10
+//   stop = A + 1.750*(X-A) = 55.27 + 1.750*8.53 = 70.19  (beyond the 1.618 far edge, non-zero gap)
+//
+// Case Study 2 (replacement) — BTC/USDT Bullish Bat
+//   X=53500  A=71980  (xaLeg = A-X = 18480, isBullish = true)
+//   D-of-XA at 0.886 -> A + 0.886*(X-A) = 71980 + 0.886*(53500-71980) = 55,607  [matches §10.2]
+//   stop = A + 1.050*(X-A) = 71980 + 1.050*(-18480) = 52,576  (below X, non-zero gap to invalidation)
+// ============================================================================
