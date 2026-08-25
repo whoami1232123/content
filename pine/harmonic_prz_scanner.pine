@@ -111,6 +111,7 @@ useCrab      = input.bool(true, "Crab",      group = grpPat)
 
 grpRisk = "Tolerance & Risk (§2.4, §7)"
 tolPct         = input.float(2.0, "Ratio tolerance (%, ratio-space — see header)", minval = 0.1, step = 0.1, group = grpRisk)
+maxSpreadPct   = input.float(15.0, "Max PRZ contributor spread, % of XA leg (§6.3)", minval = 1.0, step = 1.0, group = grpRisk, tooltip = "The PRZ is where the XA-ratio, BC-projection and AB=CD projections CONVERGE. If their midpoints disagree by more than this fraction of the XA leg, the ratios do not agree on a zone (PRZ_DISPERSED) and the candidate never arms. Raise to accept looser confluence and get more setups; lower for only tight, high-quality zones.")
 rrMin          = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5, step = 0.1, group = grpRisk)
 stopBufA       = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio", minval = 0.0, step = 0.01, group = grpRisk)
 requireConfirm = input.bool(true, "Require a confirmation candle inside the PRZ (§7.4)", group = grpRisk, tooltip = "PRD §7.4: never rest a blind limit order at D. Turning this OFF enters on first PRZ touch — more trades, materially worse strategy, and contrary to the spec.")
@@ -292,7 +293,7 @@ if array.size(defs) > 0
                     if shapeOk
                         anyShapeOkThisBar := true
 
-                        // §6.1/§6.2 — PRZ envelope from three contributors
+                        // §6.1/§6.2 — the three contributors, as prices
                         pXAlo = A.price + pd.dLo * (X.price - A.price)
                         pXAhi = A.price + pd.dHi * (X.price - A.price)
                         pBClo = C.price - pd.bcLo * bcLeg
@@ -301,10 +302,34 @@ if array.size(defs) > 0
                         pCDhi = C.price - pd.cdHi * abLeg
                         tolPrice = (tolPct / 100) * math.abs(xaLeg)
 
+                        // §6.3 CONVERGENCE — do the three projections actually AGREE on
+                        // where D is? Measured on each contributor's midpoint, so a
+                        // pattern with a legitimately wide D band (Butterfly, 1.270-1.618)
+                        // isn't penalised for its own definition. If they disagree by more
+                        // than maxSpreadPct of the XA leg the candidate is PRZ_DISPERSED:
+                        // there is no coherent zone to trade, so it never arms.
+                        // Without this filter the union envelope below spans everything
+                        // from the XA ratio to a 3.618 BC projection — wide enough that
+                        // the §7.1 stop-outside-PRZ invariant can never be satisfied,
+                        // which silently blocked nearly every trade.
+                        mXA = A.price + ((pd.dLo + pd.dHi) / 2) * (X.price - A.price)
+                        mBC = C.price - ((pd.bcLo + pd.bcHi) / 2) * bcLeg
+                        mCD = C.price - ((pd.cdLo + pd.cdHi) / 2) * abLeg
+                        spreadPx = math.max(math.max(mXA, mBC), mCD) - math.min(math.min(mXA, mBC), mCD)
+                        converged = (spreadPx / math.abs(xaLeg)) <= (maxSpreadPct / 100)
+
                         envLo = math.min(math.min(math.min(pXAlo, pXAhi), math.min(pBClo, pBChi)), math.min(pCDlo, pCDhi)) - tolPrice
                         envHi = math.max(math.max(math.max(pXAlo, pXAhi), math.max(pBClo, pBChi)), math.max(pCDlo, pCDhi)) + tolPrice
                         zLo = math.min(envLo, envHi)
                         zHi = math.max(envLo, envHi)
+
+                        // §7.1 invariant, tested against the PATTERN'S OWN D band (the
+                        // §3.2 "D (of XA)" column) rather than the union envelope. The
+                        // D column is what defines the pattern's PRZ; the BC and AB=CD
+                        // projections are confluence evidence, not the stop reference.
+                        stopPx = A.price + (pd.stopR + stopBufA) * (X.price - A.price)
+                        dFar = isBullish ? math.min(pXAlo, pXAhi) : math.max(pXAlo, pXAhi)
+                        stopOutsideD = isBullish ? stopPx < dFar : stopPx > dFar
 
                         // Zone reached: wick-based by default (what actually happens at
                         // a reversal zone). Entry price is still the confirmation bar's
@@ -316,13 +341,10 @@ if array.size(defs) > 0
                         invalidBreached = isBullish ? refPrice < invalidPrice : refPrice > invalidPrice
 
                         az = array.get(armed, i)
-                        if touched and not invalidBreached and az.barsLeft <= 0 and array.get(lastZoneC, i) != C.idx
+                        if touched and converged and stopOutsideD and not invalidBreached and az.barsLeft <= 0 and array.get(lastZoneC, i) != C.idx
                             array.set(lastZoneC, i, C.idx)
                             array.set(cntZone, i, array.get(cntZone, i) + 1)
                             przActiveThisBar := true
-
-                            // §7.1 — stop ratio is per-pattern, never per trading-style
-                            stopPx = A.price + (pd.stopR + stopBufA) * (X.price - A.price)
 
                             az.barsLeft     := confirmBars
                             az.isBull       := isBullish
@@ -379,11 +401,11 @@ if array.size(armed) > 0
                     risk = math.abs(entryPrice - az.stopPrice)
                     rr2 = risk > 0 ? math.abs(tp2 - entryPrice) / risk : 0.0
 
-                    // §7.1 hard invariant: the stop must sit outside the PRZ it
-                    // entered from, on the far side. Enforced, not assumed.
-                    stopOutsidePrz = az.isBull ? az.stopPrice < az.przLo : az.stopPrice > az.przHi
-
-                    if risk > 0 and rr2 >= rrMin and stopOutsidePrz   // §7.6 gates
+                    // §7.1's stop-outside-PRZ invariant is checked at ARM time
+                    // against the pattern's own D band (stopOutsideD above), not
+                    // re-checked here against the union envelope — doing that was
+                    // the bug that blocked ~65 of 66 zones from ever trading.
+                    if risk > 0 and rr2 >= rrMin   // §7.6 gates
                         fired := true
                         array.set(lastSigC, i, az.ci)
                         array.set(cntTrades, i, array.get(cntTrades, i) + 1)
