@@ -10,9 +10,8 @@
 //   - Butterfly/Crab stop = own PRZ edge (0 buffer) -> stopR extends past it
 //   - "1.130 XA" stop applied to all patterns        -> stop ratio is per-pattern
 //   - targets measured off the CD leg                -> targets are on the AD leg
-//   - blind limit order at D                         -> requires an engulfing
-//                                                        confirmation inside the
-//                                                        zone before any entry
+//   - blind limit order at D                         -> requires a confirmation
+//                                                        candle inside the zone
 //
 // WHY A strategy() AND NOT AN indicator()
 //   A strategy() is what makes historical validation real rather than asserted:
@@ -21,51 +20,67 @@
 //   it onto, and reports win rate, profit factor, drawdown and a full trade
 //   list computed from THIS code, not from a claim in a document.
 //
+// ---------------------------------------------------------------------------
+// SIGNAL FUNNEL (read this before concluding "it doesn't work")
+//   Stage 1  shape      B and C ratios land in a pattern's window (§3.2)
+//   Stage 2  zone       price reaches the computed PRZ -> the zone ARMS
+//   Stage 3  confirm    within `confirmBars` bars, a confirmation candle prints
+//   Stage 4  gate       R:R to TP2 >= rrMin (§7.6)  -> trade fires
+//   The on-chart table reports Zone (stage 2) and Trades (stage 4) separately,
+//   so you can see WHICH stage is filtering, rather than guessing.
+//
+// TWO DESIGN BUGS FIXED IN THIS REVISION — both made signals multiplicatively
+// rarer than the spec intends, and together explain near-zero trade counts
+// across BTCUSDT / ETHUSD / ADAUSDT / NBIX / PFE / AZTA daily histories:
+//   1. CONFIRMATION WINDOW. The previous revision required price to close
+//      inside the PRZ *and* that exact bar to be an engulfing candle — one
+//      bar satisfying two largely independent conditions. A PRZ visit lasts
+//      only a few bars, and the odds any single one of them is also engulfing
+//      are low, so the two rare events multiplied. Now the zone ARMS on entry
+//      and stays armed for `confirmBars` bars, which is how §7.4's "a
+//      confirmation while price is inside the PRZ" was always meant to read.
+//   2. CANDIDATE ENUMERATION. The previous revision tested exactly one XABC
+//      (the four most recent pivots). PRD §5.3 specifies enumerating over the
+//      last N pivots. Now `maxCombos` sliding windows are tested per bar, so a
+//      pattern whose C formed a few pivots back can still complete.
+// ---------------------------------------------------------------------------
+//
 // HOW TO HISTORICALLY VALIDATE THIS SCRIPT (PRD §11.5)
-//   1. Non-repainting check: apply to a liquid chart (e.g. BTCUSDT, 1H), open
-//      Bar Replay, step forward. A drawn pattern polygon/PRZ box must NEVER
-//      disappear or move on a later bar — only ever turn stale/invalidated.
-//      This is guaranteed structurally here: ta.pivothigh/pivotlow only ever
-//      return a value `pivotDepth` bars AFTER the pivot bar, once confirmed.
-//   2. Case-study reproduction: load XAG/USD on a daily chart around the
-//      corrected PRD §10.1 dates. The script's plotted B should print near
-//      61.97 (78.6% of XA), and the PRZ band near 66.10 (1.270 XA) — NOT the
-//      source brief's incorrect 61.10 / 64.88-65.21. See the worked check at
-//      the bottom of this file.
-//   3. Strategy Tester: open the "Strategy Tester" tab -> Performance Summary
-//      for net profit / win rate / profit factor, and List of Trades to
-//      cross-check individual fills against the on-chart PRZ/stop/TP levels.
-//      Commission (0.05%) and slippage (2 ticks) are set as fixed defaults in
-//      the strategy() declaration below — override them from the chart's
-//      "Properties" tab -> "Commission and slippage" to match your venue
-//      before drawing ANY conclusion from the numbers (PRD §7.2, §11.5 step 3).
-//   4. Gate verification: in the trade list, confirm no trade's stop sits
-//      inside the PRZ it entered from, and every trade's realized R:R to TP2
-//      is >= rrMin. A violation is a script defect, not a market outcome.
+//   1. Non-repainting: apply to a liquid chart (e.g. BTCUSDT, 1H), open Bar
+//      Replay, step forward. A drawn polygon/PRZ box must NEVER disappear or
+//      move on a later bar. Guaranteed structurally: ta.pivothigh/pivotlow
+//      only return a value `pivotDepth` bars AFTER the pivot, once confirmed.
+//   2. Case-study reproduction: load XAG/USD daily around the corrected PRD
+//      §10.1 dates. Plotted B should print near 61.97 (78.6% of XA) and the
+//      PRZ near 66.10 (1.270 XA) — NOT the source brief's incorrect 61.10 /
+//      64.88-65.21. See the worked checks at the bottom of this file.
+//   3. Strategy Tester: Performance Summary for net profit / win rate / PF,
+//      List of Trades to cross-check fills against on-chart PRZ/stop/TP.
+//      Commission (0.05%) and slippage (2 ticks) are fixed defaults in the
+//      strategy() declaration — override from Properties -> "Commission and
+//      slippage" to match your venue before drawing ANY conclusion (§7.2).
+//   4. Gate verification: no trade's stop may sit inside the PRZ it entered
+//      from, and every trade's R:R to TP2 must be >= rrMin. A violation is a
+//      script defect, not a market outcome.
 //
 // SCOPE (PRD §1.6, §11 Phase 1): Gartley, Bat, Butterfly, Crab. One symbol,
-// one timeframe, per chart — this is a scanner for the chart it's applied to,
-// not the multi-symbol watchlist scanner or the manual-plotting mode from the
-// PRD (§5.3, §8) — Pine cannot provide either; see §1.6's disposition table.
-// Shark (5-point O-X-A-B-C, §3.3) is Phase 2 and not implemented here.
+// one timeframe, per chart — not the multi-symbol watchlist scanner or the
+// manual-plotting mode (PRD §5.3, §8); Pine cannot provide either. Shark
+// (5-point O-X-A-B-C, §3.3) is Phase 2 and not implemented here.
 //
-// TOLERANCE NOTE (PRD §1.6 "Tolerance implementation note"): tolPct below is
-// applied directly in ratio space to every constraint window (B, C, BC-proj,
-// AB=CD, D) for implementation simplicity — the common convention in public
-// Pine harmonic scripts. The PRZ envelope itself IS computed the spec-faithful
-// way: three contributor prices, then a single price-width tolerance band
-// (tolPct% of |A-X|) around their min/max (§6.2).
+// TOLERANCE NOTE (PRD §1.6): tolPct is applied in ratio space to the B and C
+// constraint windows for implementation simplicity — the common convention in
+// public Pine harmonic scripts. The PRZ envelope itself IS computed the
+// spec-faithful way: three contributor prices, then a single price-width
+// tolerance band (tolPct% of |A-X|) around their min/max (§6.2).
 // ============================================================================
 
 //@version=6
-// Commission/slippage are fixed defaults here rather than script inputs — the
-// strategy() declaration statement must be the first statement in the script,
-// so it cannot reference input.*() variables declared elsewhere, and inlining
-// input.*() calls as its own argument values is unreliable across Pine Editor
-// versions. Override both from the chart's "Properties" tab -> "Commission
-// and slippage" instead (PRD §7.2, §11.5 step 3 — do this before drawing ANY
-// conclusion from the Strategy Tester; these defaults are deliberately non-zero
-// so a fresh load isn't silently flattered, but they are still only a guess).
+// Commission/slippage are fixed defaults rather than script inputs — the
+// strategy() declaration must be the first statement in the script, so it
+// cannot reference input.*() variables declared elsewhere, and inlining
+// input.*() calls as its argument values is unreliable across Pine Editor
+// versions. Override both from Properties -> "Commission and slippage".
 strategy("Harmonic PRZ Matrix — Gartley/Bat/Butterfly/Crab",
     shorttitle = "Harmonic PRZ",
     overlay = true,
@@ -78,14 +93,15 @@ strategy("Harmonic PRZ Matrix — Gartley/Bat/Butterfly/Crab",
     commission_type = strategy.commission.percent,
     commission_value = 0.05,
     slippage = 2,
-    max_lines_count = 300, max_boxes_count = 300, max_labels_count = 300)
+    max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
 
 // ---------------------------------------------------------------- Inputs ---
 grpDet = "Detection (§5)"
-pivotDepth = input.int(5, "Pivot confirmation depth (bars each side)", minval = 2, group = grpDet, tooltip = "A pivot only becomes visible pivotDepth bars after it forms — this is what makes detection non-repainting (§5.2 D1/D2).")
+pivotDepth = input.int(5, "Pivot confirmation depth (bars each side)", minval = 2, group = grpDet, tooltip = "A pivot only becomes visible pivotDepth bars after it forms — this is what makes detection non-repainting (§5.2 D1/D2). Lower = more pivots, more candidates, more noise.")
 maxPivots  = input.int(60, "Max stored zig-zag points", minval = 12, group = grpDet)
-showCandidates = input.bool(true, "Show diagnostic dot on any partial B/C match", group = grpDet, tooltip = "A full trade requires B, C, the PRZ, an engulfing confirmation AND the R:R gate to all pass on one structure — genuinely rare. This dot fires on the much weaker condition of just B and C matching some pattern's window, so you can see the scanner is alive between full setups.")
-showPerfTable = input.bool(true, "Show on-chart performance table", group = grpDet, tooltip = "Per-pattern trade/TP1/TP2/SL counts, updated live on the chart — no need to open the Strategy Tester tab to see whether the script has done anything. A simplified parallel tracker (§7.2 realism caveats apply); the Strategy Tester remains the authoritative number for §11.5 validation.")
+maxCombos  = input.int(3, "XABC windows tested per bar (§5.3)", minval = 1, maxval = 12, group = grpDet, tooltip = "1 tests only the four most recent pivots — that was the old behavior and it under-detects badly. Higher values slide the window back so a pattern whose C formed a few pivots ago can still complete. PRD §5.3 specifies enumeration; this is the bounded form of it.")
+showCandidates = input.bool(true, "Show diagnostic dot on any partial B/C match", group = grpDet, tooltip = "Fires on the weak condition of B and C alone matching a pattern window — far more often than a full trade. Confirms the scanner is alive between setups.")
+showPerfTable = input.bool(true, "Show on-chart performance table", group = grpDet, tooltip = "Per-pattern Zone/Trades/TP1/TP2/SL counts, live on the chart. A simplified parallel tracker (§7.2 caveats apply); the Strategy Tester remains authoritative for §11.5.")
 
 grpPat = "Patterns (§3.2)"
 useGartley   = input.bool(true, "Gartley",   group = grpPat)
@@ -94,12 +110,14 @@ useButterfly = input.bool(true, "Butterfly", group = grpPat)
 useCrab      = input.bool(true, "Crab",      group = grpPat)
 
 grpRisk = "Tolerance & Risk (§2.4, §7)"
-tolPct        = input.float(2.0, "Ratio tolerance (%, ratio-space — see file header)", minval = 0.1, step = 0.1, group = grpRisk)
-rrMin         = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5, step = 0.1, group = grpRisk)
-stopBufA      = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio (added to stopR)", minval = 0.0, step = 0.01, group = grpRisk)
-requireConfirm = input.bool(true, "Require engulfing confirmation inside the PRZ before entry (§7.4)", group = grpRisk)
-riskPct       = input.float(1.0, "Risk % of equity per trade (§7.5)", minval = 0.1, step = 0.1, group = grpRisk)
-useWickForZone = input.bool(false, "Test zone entry on wick, not close (§6.4)", group = grpRisk, tooltip = "PRD §6.4 default is close-based: a bar only counts as touching the PRZ if it CLOSES inside it, matching this strategy's process_orders_on_close=true fill price. Wick-based is more sensitive (catches an intrabar spike into the zone) but the drawn D point and computed entry/stop/TP will then disagree with where the trade actually filled — off by default for that reason.")
+tolPct         = input.float(2.0, "Ratio tolerance (%, ratio-space — see header)", minval = 0.1, step = 0.1, group = grpRisk)
+rrMin          = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5, step = 0.1, group = grpRisk)
+stopBufA       = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio", minval = 0.0, step = 0.01, group = grpRisk)
+requireConfirm = input.bool(true, "Require a confirmation candle inside the PRZ (§7.4)", group = grpRisk, tooltip = "PRD §7.4: never rest a blind limit order at D. Turning this OFF enters on first PRZ touch — more trades, materially worse strategy, and contrary to the spec.")
+confirmBars    = input.int(5, "Bars the PRZ stays armed awaiting confirmation", minval = 1, maxval = 50, group = grpRisk, tooltip = "Once price reaches the PRZ the zone ARMS for this many bars, during which a confirmation candle triggers entry. 1 reproduces the old (buggy) same-bar-only behavior. This is the single biggest driver of how many trades fire.")
+useEngulfOnly  = input.bool(false, "Confirmation must be a full engulfing candle", group = grpRisk, tooltip = "OFF (default): a full engulfing OR a rejection/pin candle closing in the trade direction counts. ON: engulfing only — stricter, far fewer trades.")
+riskPct        = input.float(1.0, "Risk % of equity per trade (§7.5)", minval = 0.1, step = 0.1, group = grpRisk)
+useWickForZone = input.bool(true, "Zone touch counts on wick (not just close)", group = grpRisk, tooltip = "ON (default): the PRZ is considered reached if the bar's wick trades into it — which is what actually happens at a reversal zone. The ENTRY price is still the confirmation bar's close, so drawn levels always match the real fill. OFF: the bar must CLOSE inside the zone (PRD §6.4 strict reading) — more conservative, fewer arms.")
 
 // ----------------------------------------------------------------- Types ---
 type Pivot
@@ -123,6 +141,26 @@ type PatternDef
     float  stopR
     color  col
 
+// An armed PRZ: price has reached the zone and we are now waiting, for up to
+// `confirmBars` bars, for a confirmation candle. Holds everything needed to
+// compute the trade and draw the polygon at confirmation time.
+type ArmedZone
+    int   barsLeft
+    bool  isBull
+    float stopPrice
+    float aPrice
+    float invalidPrice
+    float przLo
+    float przHi
+    int   xi
+    float xp
+    int   ai
+    float ap
+    int   bi
+    float bp
+    int   ci
+    float cp
+
 // ------------------------------------------------------------ Persisted ---
 // Declared before the helpers below, because a Pine function reading a global
 // var must see it declared earlier in the script — Pine does not hoist.
@@ -130,33 +168,32 @@ var Pivot[]      zz       = array.new<Pivot>()
 var PatternDef[] defs     = array.new<PatternDef>()
 var int[]        lastSigC = array.new<int>()
 
-// Lightweight parallel outcome tracker for the on-chart performance table
-// below (§ "On-chart report"). Purely observational — it reads the same
-// stop/tp1/tp2 a signal computed and watches subsequent bars' high/low for
-// a touch, entirely separate from strategy.entry/exit. It does NOT model
+// Outcome tracker for the on-chart table. Purely observational — reads the
+// same stop/tp1/tp2 a signal computed and watches later bars' high/low for a
+// touch, entirely separate from strategy.entry/exit. It does NOT model
 // commission/slippage or same-bar stop-vs-target ambiguity as precisely as
-// the Strategy Tester does (§7.2, §11.5) — for a rigorous number, use the
-// Strategy Tester; this table exists so a signal's outcome is visible
-// without leaving the chart.
-var bool  tradeOpen        = false
-var int   tradePatternIdx  = -1
-var float tradeStop        = na
-var float tradeTp1         = na
-var float tradeTp2         = na
-var bool  tradeIsBullish   = false
-var bool  tp1AlreadyHit    = false
+// the Strategy Tester (§7.2, §11.5); for a rigorous number use that tab.
+var bool  tradeOpen       = false
+var int   tradePatternIdx = -1
+var float tradeStop       = na
+var float tradeTp1        = na
+var float tradeTp2        = na
+var bool  tradeIsBullish  = false
+var bool  tp1AlreadyHit   = false
 var int[] cntTrades = array.new<int>()
 var int[] cntTP1    = array.new<int>()
 var int[] cntTP2    = array.new<int>()
 var int[] cntSL     = array.new<int>()
 
-// Funnel diagnostic: counts distinct candidates that reached the PRZ at all
-// (one count per unique C pivot, like lastSigC dedupes trades), regardless of
-// whether they ever got confirmed. Zone minus Trades = how much the engulfing
-// confirmation + R:R gate is filtering out, separate from how rarely price
-// reaches the PRZ in the first place.
+// Funnel diagnostic: distinct candidates that reached the PRZ and armed,
+// regardless of whether they ever confirmed. Zone minus Trades isolates how
+// much the confirmation + R:R gate filters, separately from how often price
+// reaches a valid PRZ at all.
 var int[] lastZoneC = array.new<int>()
 var int[] cntZone   = array.new<int>()
+
+// One armed-zone slot per pattern. barsLeft > 0 means armed.
+var ArmedZone[] armed = array.new<ArmedZone>()
 
 // -------------------------------------------------------------- Helpers ---
 inWindow(float val, float lo, float hi, float tol) =>
@@ -190,14 +227,20 @@ if barstate.isfirst
         array.push(defs, PatternDef.new("Butterfly", 0.786, 0.786, 0.382, 0.886, 1.618, 2.240, 1.270, 1.618, 1.270, 1.618, 1.618, 1.750, color.new(color.orange, 0)))
     if useCrab
         array.push(defs, PatternDef.new("Crab",      0.382, 0.618, 0.382, 0.886, 2.240, 3.618, 1.618, 1.618, 1.618, 1.618, 1.618, 1.902, color.new(color.red, 0)))
-    for i = 0 to array.size(defs) - 1
-        array.push(lastSigC, -1)
-        array.push(cntTrades, 0)
-        array.push(cntTP1, 0)
-        array.push(cntTP2, 0)
-        array.push(cntSL, 0)
-        array.push(lastZoneC, -1)
-        array.push(cntZone, 0)
+    // Guarded for the same reason as the loops below: with every pattern
+    // disabled defs is empty, and Pine's `for 0 to -1` counts DOWNWARD — it
+    // would push two phantom slots and desync `armed` from `defs`, which the
+    // Stage 3 loop then reads out of bounds.
+    if array.size(defs) > 0
+        for i = 0 to array.size(defs) - 1
+            array.push(lastSigC, -1)
+            array.push(cntTrades, 0)
+            array.push(cntTP1, 0)
+            array.push(cntTP2, 0)
+            array.push(cntSL, 0)
+            array.push(lastZoneC, -1)
+            array.push(cntZone, 0)
+            array.push(armed, ArmedZone.new(0, false, na, na, na, na, na, 0, na, 0, na, 0, na, 0, na))
 
 // ---------------------------------------------------------- Pivot feed  ---
 ph = ta.pivothigh(pivotDepth, pivotDepth)
@@ -209,127 +252,174 @@ if not na(pl)
     addPivot(pl, bar_index - pivotDepth, false)
 
 // alertcondition/plotchar need plain series computed unconditionally every bar
-var bool przActiveThisBar = false
+var bool przActiveThisBar  = false
 var bool anyShapeOkThisBar = false
-przActiveThisBar := false
+przActiveThisBar  := false
 anyShapeOkThisBar := false
 
-// --------------------------------------------------- Candidate scanning ---
-if array.size(zz) >= 4 and array.size(defs) > 0
+// ------------------------------------- Stage 1+2: shape match, arm the zone ---
+// Enumerates `maxCombos` sliding XABC windows (PRD §5.3). k=0 is the four most
+// recent pivots; higher k slides the whole window one pivot further back, so a
+// structure whose C formed a while ago can still complete now.
+if array.size(defs) > 0
     n = array.size(zz)
-    X = array.get(zz, n - 4)
-    A = array.get(zz, n - 3)
-    B = array.get(zz, n - 2)
-    C = array.get(zz, n - 1)
+    for k = 0 to maxCombos - 1
+        if n >= 4 + k
+            X = array.get(zz, n - 4 - k)
+            A = array.get(zz, n - 3 - k)
+            B = array.get(zz, n - 2 - k)
+            C = array.get(zz, n - 1 - k)
 
-    xaLeg = A.price - X.price          // §2.1 P(A,X,r) = A + r*(X-A); sign of this leg carries direction
-    abLeg = A.price - B.price
-    bcLeg = C.price - B.price
+            xaLeg = A.price - X.price   // §2.1 P(A,X,r) = A + r*(X-A); sign carries direction
+            abLeg = A.price - B.price
+            bcLeg = C.price - B.price
 
-    if xaLeg != 0 and abLeg != 0 and bcLeg != 0
-        isBullish  = xaLeg > 0          // A>X: XA rises -> D projects down -> long at D (§2.3)
-        // §6.4 — close-based by default, and critically must match the price the
-        // strategy actually fills at (process_orders_on_close=true fills at `close`).
-        // Using the wick here would draw a D point and compute a stop/TP/R:R for a
-        // price the trade never actually entered at.
-        dTestPrice = useWickForZone ? (isBullish ? low : high) : close
+            if xaLeg != 0 and abLeg != 0 and bcLeg != 0
+                isBullish = xaLeg > 0   // A>X: XA rises -> D projects down -> long at D (§2.3)
 
-        // Only B and C are gated here (§2.2): both are fixed once C confirms and don't
-        // depend on the still-forming D. BC-projection, AB=CD and the D-of-XA ratio are
-        // NOT re-tested against dTestPrice here — instead the PRZ envelope below converts
-        // each of their ratio windows directly into contributor PRICES (§6.1/§6.2), and
-        // membership in the resulting union interval is what gates D. That is the
-        // spec-faithful PRZ definition: a convergence band, not three independent checks
-        // that all have to pass on the same live D estimate.
-        bRatio = abLeg / xaLeg                              // §2.2 B retracement of XA
-        cRatio = (C.price - B.price) / abLeg                // §2.2 C retracement of AB
+                // Only B and C are gated here (§2.2): both are fixed once C confirms
+                // and don't depend on the still-forming D. BC-projection, AB=CD and
+                // the D-of-XA ratio become contributor PRICES in the envelope below
+                // (§6.1/§6.2); membership in that band is what gates D. That is the
+                // spec-faithful PRZ: a convergence band, not three separate tests.
+                bRatio = abLeg / xaLeg
+                cRatio = bcLeg / abLeg
+                validSide = bRatio > 0 and cRatio > 0
 
-        validSide = bRatio > 0 and cRatio > 0
+                for i = 0 to array.size(defs) - 1
+                    pd = array.get(defs, i)
+                    shapeOk = validSide and inWindow(bRatio, pd.bLo, pd.bHi, tolPct / 100) and inWindow(cRatio, pd.cLo, pd.cHi, tolPct / 100)
+                    if shapeOk
+                        anyShapeOkThisBar := true
 
-        for i = 0 to array.size(defs) - 1
+                        // §6.1/§6.2 — PRZ envelope from three contributors
+                        pXAlo = A.price + pd.dLo * (X.price - A.price)
+                        pXAhi = A.price + pd.dHi * (X.price - A.price)
+                        pBClo = C.price - pd.bcLo * bcLeg
+                        pBChi = C.price - pd.bcHi * bcLeg
+                        pCDlo = C.price - pd.cdLo * abLeg
+                        pCDhi = C.price - pd.cdHi * abLeg
+                        tolPrice = (tolPct / 100) * math.abs(xaLeg)
+
+                        envLo = math.min(math.min(math.min(pXAlo, pXAhi), math.min(pBClo, pBChi)), math.min(pCDlo, pCDhi)) - tolPrice
+                        envHi = math.max(math.max(math.max(pXAlo, pXAhi), math.max(pBClo, pBChi)), math.max(pCDlo, pCDhi)) + tolPrice
+                        zLo = math.min(envLo, envHi)
+                        zHi = math.max(envLo, envHi)
+
+                        // Zone reached: wick-based by default (what actually happens at
+                        // a reversal zone). Entry price is still the confirmation bar's
+                        // close, so drawn levels always match the real fill.
+                        touched = useWickForZone ? (low <= zHi and high >= zLo) : (close >= zLo and close <= zHi)
+
+                        invalidPrice = A.price + pd.invalidR * (X.price - A.price)
+                        refPrice = useWickForZone ? (isBullish ? low : high) : close
+                        invalidBreached = isBullish ? refPrice < invalidPrice : refPrice > invalidPrice
+
+                        az = array.get(armed, i)
+                        if touched and not invalidBreached and az.barsLeft <= 0 and array.get(lastZoneC, i) != C.idx
+                            array.set(lastZoneC, i, C.idx)
+                            array.set(cntZone, i, array.get(cntZone, i) + 1)
+                            przActiveThisBar := true
+
+                            // §7.1 — stop ratio is per-pattern, never per trading-style
+                            stopPx = A.price + (pd.stopR + stopBufA) * (X.price - A.price)
+
+                            az.barsLeft     := confirmBars
+                            az.isBull       := isBullish
+                            az.stopPrice    := stopPx
+                            az.aPrice       := A.price
+                            az.invalidPrice := invalidPrice
+                            az.przLo        := zLo
+                            az.przHi        := zHi
+                            az.xi           := X.idx
+                            az.xp           := X.price
+                            az.ai           := A.idx
+                            az.ap           := A.price
+                            az.bi           := B.idx
+                            az.bp           := B.price
+                            az.ci           := C.idx
+                            az.cp           := C.price
+
+                            box.new(C.idx, zHi, bar_index + confirmBars, zLo, xloc = xloc.bar_index, bgcolor = color.new(pd.col, 70), border_color = color.new(pd.col, 15), border_width = 2)
+
+// ------------------------------- Stage 3+4: confirmation window, then entry ---
+// Runs every bar over whatever is armed. A confirmation candle inside the
+// window fires the trade; invalidation or an expired countdown disarms it.
+// Guarded: with every pattern disabled the arrays are empty, and Pine's
+// `for 0 to -1` counts DOWNWARD rather than skipping — an unguarded loop
+// would read index -1 and throw at runtime.
+if array.size(armed) > 0
+    for i = 0 to array.size(armed) - 1
+        az = array.get(armed, i)
+        if az.barsLeft > 0
             pd = array.get(defs, i)
+            breached = az.isBull ? low < az.invalidPrice : high > az.invalidPrice
+            if breached
+                az.barsLeft := 0
+            else
+                // Confirmation (§7.4). Full engulfing, or — unless useEngulfOnly
+                // — a rejection candle: closes in the trade direction with a long
+                // wick back out of the zone, which is the more common way a PRZ
+                // actually reverses.
+                rng = high - low
+                bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+                bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+                bullPin = rng > 0 and close > open and (math.min(open, close) - low) / rng >= 0.5
+                bearPin = rng > 0 and close < open and (high - math.max(open, close)) / rng >= 0.5
+                bullOk = useEngulfOnly ? bullEngulf : (bullEngulf or bullPin)
+                bearOk = useEngulfOnly ? bearEngulf : (bearEngulf or bearPin)
+                confirmed = not requireConfirm or (az.isBull ? bullOk : bearOk)
+                fired = false
 
-            shapeOk = validSide and inWindow(bRatio, pd.bLo, pd.bHi, tolPct / 100) and inWindow(cRatio, pd.cLo, pd.cHi, tolPct / 100)
-            if shapeOk
-                anyShapeOkThisBar := true
+                if confirmed and array.get(lastSigC, i) != az.ci
+                    entryPrice = close                       // matches process_orders_on_close
+                    adLeg = az.aPrice - entryPrice
+                    tp1 = entryPrice + 0.382 * adLeg         // §7.3 — AD leg, not CD
+                    tp2 = entryPrice + 0.618 * adLeg
+                    risk = math.abs(entryPrice - az.stopPrice)
+                    rr2 = risk > 0 ? math.abs(tp2 - entryPrice) / risk : 0.0
 
-            if shapeOk
-                // §6.1/§6.2 — PRZ envelope from three contributors, spec-faithful price tolerance
-                pXAlo = A.price + pd.dLo * (X.price - A.price)
-                pXAhi = A.price + pd.dHi * (X.price - A.price)
-                pBClo = C.price - pd.bcLo * bcLeg
-                pBChi = C.price - pd.bcHi * bcLeg
-                pCDlo = C.price - pd.cdLo * abLeg
-                pCDhi = C.price - pd.cdHi * abLeg
-                tolPrice = (tolPct / 100) * math.abs(xaLeg)
+                    // §7.1 hard invariant: the stop must sit outside the PRZ it
+                    // entered from, on the far side. Enforced, not assumed.
+                    stopOutsidePrz = az.isBull ? az.stopPrice < az.przLo : az.stopPrice > az.przHi
 
-                envLo = math.min(math.min(math.min(pXAlo, pXAhi), math.min(pBClo, pBChi)), math.min(pCDlo, pCDhi)) - tolPrice
-                envHi = math.max(math.max(math.max(pXAlo, pXAhi), math.max(pBClo, pBChi)), math.max(pCDlo, pCDhi)) + tolPrice
+                    if risk > 0 and rr2 >= rrMin and stopOutsidePrz   // §7.6 gates
+                        fired := true
+                        array.set(lastSigC, i, az.ci)
+                        array.set(cntTrades, i, array.get(cntTrades, i) + 1)
+                        if not tradeOpen
+                            tradeOpen       := true
+                            tradePatternIdx := i
+                            tradeStop       := az.stopPrice
+                            tradeTp1        := tp1
+                            tradeTp2        := tp2
+                            tradeIsBullish  := az.isBull
+                            tp1AlreadyHit   := false
 
-                invalidPrice = A.price + pd.invalidR * (X.price - A.price)
-                invalidBreached = isBullish ? dTestPrice < invalidPrice : dTestPrice > invalidPrice
+                        qty = (strategy.equity * riskPct / 100) / risk
+                        entryId = pd.name + "_" + str.tostring(az.ci)
+                        if az.isBull
+                            strategy.entry(entryId, strategy.long, qty = qty)
+                        else
+                            strategy.entry(entryId, strategy.short, qty = qty)
+                        strategy.exit(entryId + "_x1", from_entry = entryId, stop = az.stopPrice, limit = tp1, qty_percent = 50)
+                        strategy.exit(entryId + "_x2", from_entry = entryId, stop = az.stopPrice, limit = tp2, qty_percent = 50)
 
-                inZone = dTestPrice >= math.min(envLo, envHi) and dTestPrice <= math.max(envLo, envHi)
+                        line.new(az.xi, az.xp, az.ai, az.ap, xloc = xloc.bar_index, color = pd.col, width = 2)
+                        line.new(az.ai, az.ap, az.bi, az.bp, xloc = xloc.bar_index, color = pd.col, width = 2)
+                        line.new(az.bi, az.bp, az.ci, az.cp, xloc = xloc.bar_index, color = pd.col, width = 2)
+                        line.new(az.ci, az.cp, bar_index, entryPrice, xloc = xloc.bar_index, color = pd.col, width = 2)
 
-                if inZone and not invalidBreached
-                    przActiveThisBar := true
-                    box.new(C.idx, math.max(envLo, envHi), bar_index, math.min(envLo, envHi), xloc = xloc.bar_index, bgcolor = color.new(pd.col, 65), border_color = color.new(pd.col, 15), border_width = 2)
+                        dirTxt = az.isBull ? "LONG" : "SHORT"
+                        label.new(bar_index, entryPrice, text = pd.name + " " + dirTxt + "  R:R " + str.tostring(rr2, "#.##"), xloc = xloc.bar_index, style = az.isBull ? label.style_label_up : label.style_label_down, color = pd.col, textcolor = color.white, size = size.small)
+                        alert(pd.name + " " + dirTxt + " confirmed — entry " + str.tostring(entryPrice) + " stop " + str.tostring(az.stopPrice) + " TP2 " + str.tostring(tp2) + " R:R " + str.tostring(rr2, "#.##"), alert.freq_once_per_bar_close)
 
-                    if array.get(lastZoneC, i) != C.idx
-                        array.set(lastZoneC, i, C.idx)
-                        array.set(cntZone, i, array.get(cntZone, i) + 1)
-
-                    bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
-                    bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
-                    confirmed = not requireConfirm or (isBullish ? bullEngulf : bearEngulf)
-
-                    if confirmed and array.get(lastSigC, i) != C.idx
-                        // §7.1 — stop ratio is per-pattern (from pd.stopR), never per trading-style
-                        stopPrice = A.price + (pd.stopR + stopBufA) * (X.price - A.price)
-                        entryPrice = dTestPrice
-                        adLeg = A.price - entryPrice
-                        tp1 = entryPrice + 0.382 * adLeg     // §7.3 — targets on the AD leg, not CD
-                        tp2 = entryPrice + 0.618 * adLeg
-                        risk = math.abs(entryPrice - stopPrice)
-                        rr2 = risk > 0 ? math.abs(tp2 - entryPrice) / risk : 0.0
-
-                        if risk > 0 and rr2 >= rrMin        // §7.6 — hard R:R gate
-                            array.set(lastSigC, i, C.idx)
-                            array.set(cntTrades, i, array.get(cntTrades, i) + 1)
-                            if not tradeOpen        // report-table tracker; pyramiding=0 means Pine itself won't stack a second real position anyway
-                                tradeOpen := true
-                                tradePatternIdx := i
-                                tradeStop := stopPrice
-                                tradeTp1 := tp1
-                                tradeTp2 := tp2
-                                tradeIsBullish := isBullish
-                                tp1AlreadyHit := false
-                            qty = (strategy.equity * riskPct / 100) / risk
-                            entryId = pd.name + "_" + str.tostring(C.idx)
-
-                            if isBullish
-                                strategy.entry(entryId, strategy.long, qty = qty)
-                            else
-                                strategy.entry(entryId, strategy.short, qty = qty)
-                            strategy.exit(entryId + "_x1", from_entry = entryId, stop = stopPrice, limit = tp1, qty_percent = 50)
-                            strategy.exit(entryId + "_x2", from_entry = entryId, stop = stopPrice, limit = tp2, qty_percent = 50)
-
-                            line.new(X.idx, X.price, A.idx, A.price, xloc = xloc.bar_index, color = pd.col, width = 2)
-                            line.new(A.idx, A.price, B.idx, B.price, xloc = xloc.bar_index, color = pd.col, width = 2)
-                            line.new(B.idx, B.price, C.idx, C.price, xloc = xloc.bar_index, color = pd.col, width = 2)
-                            line.new(C.idx, C.price, bar_index, entryPrice, xloc = xloc.bar_index, color = pd.col, width = 2)
-
-                            dirTxt = isBullish ? "LONG" : "SHORT"
-                            lbl = pd.name + " " + dirTxt + "  R:R " + str.tostring(rr2, "#.##")
-                            label.new(bar_index, entryPrice, text = lbl, xloc = xloc.bar_index, style = isBullish ? label.style_label_up : label.style_label_down, color = pd.col, textcolor = color.white, size = size.small)
-
-                            alert(pd.name + " " + dirTxt + " confirmed — entry " + str.tostring(entryPrice) + " stop " + str.tostring(stopPrice) + " TP2 " + str.tostring(tp2) + " R:R " + str.tostring(rr2, "#.##"), alert.freq_once_per_bar_close)
+                az.barsLeft := fired ? 0 : az.barsLeft - 1
 
 // ------------------------------------------------- Outcome tracking (table) ---
-// Unconditional, every bar: watches the currently open tracked signal (if any)
-// for a stop or target touch on subsequent bars' high/low. Stop is checked
-// first — if a bar's range spans both the stop and a target, this counts it
-// as a loss (pessimistic same-bar-ambiguity assumption).
+// Watches the open tracked signal for a stop or target touch. Stop is checked
+// first — if a bar spans both, it counts as a loss (pessimistic same-bar
+// assumption, deliberately not flattering).
 if tradeOpen
     hitStop = tradeIsBullish ? low <= tradeStop : high >= tradeStop
     if hitStop
@@ -346,12 +436,12 @@ if tradeOpen
             tradeOpen := false
 
 // ------------------------------------------------------------ On-chart report ---
-// Zone vs Trades is the funnel: Zone = distinct candidates that ever reached
-// the PRZ, regardless of confirmation. Trades = the subset that also got an
-// engulfing confirmation AND cleared the R:R gate. A big gap between the two
-// says the confirmation/R:R gate is the bottleneck; Zone itself near zero
-// says price rarely reaches a valid PRZ at all on this symbol/timeframe.
-if showPerfTable and barstate.islast
+// Zone vs Trades is the funnel. Zone = candidates that reached the PRZ and
+// armed. Trades = the subset that also confirmed and cleared the R:R gate.
+// Zone near zero => price rarely reaches a valid PRZ (loosen tolPct, lower
+// pivotDepth, raise maxCombos). Zone >> Trades => the confirmation/R:R gate
+// is the bottleneck (raise confirmBars, or lower rrMin).
+if showPerfTable and barstate.islast and array.size(defs) > 0
     var table perfTable = table.new(position.top_right, 7, array.size(defs) + 2, bgcolor = color.new(color.gray, 15), border_width = 1, border_color = color.gray)
     hdrBg = color.new(color.gray, 50)
     table.cell(perfTable, 0, 0, "Pattern",    text_color = color.white, bgcolor = hdrBg)
@@ -374,7 +464,7 @@ if showPerfTable and barstate.islast
         p1 = array.get(cntTP1, i)
         p2 = array.get(cntTP2, i)
         sl = array.get(cntSL, i)
-        wr = t > 0 ? str.tostring(float(p2) / t * 100, "#.#") + "%" : "—"   // float() cast avoids int/int truncation before the *100
+        wr = t > 0 ? str.tostring(float(p2) / t * 100, "#.#") + "%" : "—"   // float() cast avoids int/int truncation
         table.cell(perfTable, 0, i + 1, pdRow.name, text_color = pdRow.col)
         table.cell(perfTable, 1, i + 1, str.tostring(z))
         table.cell(perfTable, 2, i + 1, str.tostring(t))
@@ -382,11 +472,11 @@ if showPerfTable and barstate.islast
         table.cell(perfTable, 4, i + 1, str.tostring(p2))
         table.cell(perfTable, 5, i + 1, str.tostring(sl))
         table.cell(perfTable, 6, i + 1, wr)
-        totZone := totZone + z
+        totZone   := totZone + z
         totTrades := totTrades + t
-        totTP1 := totTP1 + p1
-        totTP2 := totTP2 + p2
-        totSL := totSL + sl
+        totTP1    := totTP1 + p1
+        totTP2    := totTP2 + p2
+        totSL     := totSL + sl
 
     lastRow = array.size(defs) + 1
     totWr = totTrades > 0 ? str.tostring(float(totTP2) / totTrades * 100, "#.#") + "%" : "—"
@@ -400,25 +490,23 @@ if showPerfTable and barstate.islast
 
 alertcondition(przActiveThisBar, title = "PRZ Active", message = "Price entered a harmonic PRZ zone on {{ticker}} {{interval}}")
 
-// Diagnostic only — NOT a trade signal. Fires on the much weaker condition of B
-// and C alone matching some enabled pattern's window (§2.2), which happens far
-// more often than a full PRZ entry + confirmation + R:R pass. If this dot never
-// appears either, no candidate shape is forming at all on this symbol/timeframe/
-// tolerance — try a wider tolPct, a smaller pivotDepth, or a choppier symbol.
+// Diagnostic only — NOT a trade signal. Fires when B and C alone match some
+// enabled pattern's window. If this never appears, no candidate shape is
+// forming at all: widen tolPct, lower pivotDepth, or raise maxCombos.
 plotchar(showCandidates and anyShapeOkThisBar ? high : na, title = "Candidate B/C match (diagnostic, not a signal)", char = "•", location = location.abovebar, color = color.new(color.gray, 40), size = size.tiny)
 
 // ============================================================================
-// WORKED CHECKS — PRD §10, reproduced here so the arithmetic above is
-// auditable by hand against the same numbers the PRD verified in Python.
+// WORKED CHECKS — PRD §10, reproduced so the arithmetic above is auditable by
+// hand against the same numbers the PRD verified independently in Python.
 //
 // Case Study 1 (corrected) — XAG/USD Bearish Butterfly
 //   X=63.80  A=55.27  (xaLeg = A-X = -8.53, isBullish = false)
-//   B should print near 61.97 -> bRatio = (A-B)/xaLeg = (55.27-61.97)/-8.53 = 0.786  [target 0.786]
-//   D-of-XA envelope center (1.270) -> A + 1.270*(X-A) = 55.27 + 1.270*8.53 = 66.10
-//   stop = A + 1.750*(X-A) = 55.27 + 1.750*8.53 = 70.19  (beyond the 1.618 far edge, non-zero gap)
+//   B near 61.97 -> bRatio = (A-B)/xaLeg = (55.27-61.97)/-8.53 = 0.786  [target 0.786]
+//   D-of-XA at 1.270 -> A + 1.270*(X-A) = 55.27 + 1.270*8.53 = 66.10
+//   stop = A + 1.750*(X-A) = 55.27 + 1.750*8.53 = 70.19  (beyond the 1.618 far edge)
 //
 // Case Study 2 (replacement) — BTC/USDT Bullish Bat
 //   X=53500  A=71980  (xaLeg = A-X = 18480, isBullish = true)
-//   D-of-XA at 0.886 -> A + 0.886*(X-A) = 71980 + 0.886*(53500-71980) = 55,607  [matches §10.2]
-//   stop = A + 1.050*(X-A) = 71980 + 1.050*(-18480) = 52,576  (below X, non-zero gap to invalidation)
+//   D-of-XA at 0.886 -> A + 0.886*(X-A) = 71980 + 0.886*(53500-71980) = 55,607  [§10.2]
+//   stop = A + 1.050*(X-A) = 71980 + 1.050*(-18480) = 52,576  (below X, non-zero gap)
 // ============================================================================

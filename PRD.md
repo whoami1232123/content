@@ -522,6 +522,20 @@ Entry requires at least one confirmation while price is inside the PRZ:
 
 `confirmations_required` defaults to 1 and is configurable to 2 for a stricter profile.
 
+**The confirmation window (`confirm_bars`, default 5).** "A confirmation *while price is inside
+the PRZ*" is a window, not a single bar. When price reaches the PRZ the zone **arms**, and the
+confirmation check runs on each subsequent bar until either a confirmation fires, the invalidation
+is breached, or `confirm_bars` elapse. This is a normative requirement, not an implementation
+detail: requiring the touch bar and the confirmation bar to be *the same bar* conjoins two largely
+independent events and collapses signal frequency by roughly an order of magnitude. The Phase 1
+Pine implementation shipped that bug and produced 0–2 trades across multi-year daily histories on
+six symbols (BTCUSDT, ETHUSD, ADAUSDT, NBIX, PFE, AZTA) before it was corrected — see §11.5.
+
+**Zone touch vs. entry price.** The PRZ counts as reached on a **wick** touch (price traded into
+the zone, which is what actually happens at a reversal). The **entry price is the confirmation
+bar's close**, never the wick. Conflating the two makes the drawn D point and the computed
+stop/TP/R:R describe a price the trade never filled at — also a bug found and fixed in Phase 1.
+
 ### 7.5 Position sizing
 
 ```
