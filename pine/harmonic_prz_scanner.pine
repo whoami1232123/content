@@ -35,9 +35,10 @@
 //   3. Strategy Tester: open the "Strategy Tester" tab -> Performance Summary
 //      for net profit / win rate / profit factor, and List of Trades to
 //      cross-check individual fills against the on-chart PRZ/stop/TP levels.
-//      Set commissionPct/slippageTicks below to something realistic before
-//      drawing ANY conclusion from the numbers (PRD §7.2, §11.5 step 3) — the
-//      defaults are 0, which flatters every strategy.
+//      Commission (0.05%) and slippage (2 ticks) are set as fixed defaults in
+//      the strategy() declaration below — override them from the chart's
+//      "Properties" tab -> "Commission and slippage" to match your venue
+//      before drawing ANY conclusion from the numbers (PRD §7.2, §11.5 step 3).
 //   4. Gate verification: in the trade list, confirm no trade's stop sits
 //      inside the PRZ it entered from, and every trade's realized R:R to TP2
 //      is >= rrMin. A violation is a script defect, not a market outcome.
@@ -83,6 +84,7 @@ strategy("Harmonic PRZ Matrix — Gartley/Bat/Butterfly/Crab",
 grpDet = "Detection (§5)"
 pivotDepth = input.int(5, "Pivot confirmation depth (bars each side)", minval = 2, group = grpDet, tooltip = "A pivot only becomes visible pivotDepth bars after it forms — this is what makes detection non-repainting (§5.2 D1/D2).")
 maxPivots  = input.int(60, "Max stored zig-zag points", minval = 12, group = grpDet)
+showCandidates = input.bool(true, "Show diagnostic dot on any partial B/C match", group = grpDet, tooltip = "A full trade requires B, C, the PRZ, an engulfing confirmation AND the R:R gate to all pass on one structure — genuinely rare. This dot fires on the much weaker condition of just B and C matching some pattern's window, so you can see the scanner is alive between full setups.")
 
 grpPat = "Patterns (§3.2)"
 useGartley   = input.bool(true, "Gartley",   group = grpPat)
@@ -170,9 +172,11 @@ if not na(ph)
 if not na(pl)
     addPivot(pl, bar_index - pivotDepth, false)
 
-// alertcondition needs a plain series computed unconditionally every bar
+// alertcondition/plotchar need plain series computed unconditionally every bar
 var bool przActiveThisBar = false
+var bool anyShapeOkThisBar = false
 przActiveThisBar := false
+anyShapeOkThisBar := false
 
 // --------------------------------------------------- Candidate scanning ---
 if array.size(zz) >= 4 and array.size(defs) > 0
@@ -206,6 +210,8 @@ if array.size(zz) >= 4 and array.size(defs) > 0
             pd = array.get(defs, i)
 
             shapeOk = validSide and inWindow(bRatio, pd.bLo, pd.bHi, tolPct / 100) and inWindow(cRatio, pd.cLo, pd.cHi, tolPct / 100)
+            if shapeOk
+                anyShapeOkThisBar := true
 
             if shapeOk
                 // §6.1/§6.2 — PRZ envelope from three contributors, spec-faithful price tolerance
@@ -227,7 +233,7 @@ if array.size(zz) >= 4 and array.size(defs) > 0
 
                 if inZone and not invalidBreached
                     przActiveThisBar := true
-                    box.new(C.idx, math.max(envLo, envHi), bar_index, math.min(envLo, envHi), xloc = xloc.bar_index, bgcolor = color.new(pd.col, 88), border_color = color.new(pd.col, 40), border_width = 1)
+                    box.new(C.idx, math.max(envLo, envHi), bar_index, math.min(envLo, envHi), xloc = xloc.bar_index, bgcolor = color.new(pd.col, 65), border_color = color.new(pd.col, 15), border_width = 2)
 
                     bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
                     bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
@@ -267,6 +273,13 @@ if array.size(zz) >= 4 and array.size(defs) > 0
                             alert(pd.name + " " + dirTxt + " confirmed — entry " + str.tostring(entryPrice) + " stop " + str.tostring(stopPrice) + " TP2 " + str.tostring(tp2) + " R:R " + str.tostring(rr2, "#.##"), alert.freq_once_per_bar_close)
 
 alertcondition(przActiveThisBar, title = "PRZ Active", message = "Price entered a harmonic PRZ zone on {{ticker}} {{interval}}")
+
+// Diagnostic only — NOT a trade signal. Fires on the much weaker condition of B
+// and C alone matching some enabled pattern's window (§2.2), which happens far
+// more often than a full PRZ entry + confirmation + R:R pass. If this dot never
+// appears either, no candidate shape is forming at all on this symbol/timeframe/
+// tolerance — try a wider tolPct, a smaller pivotDepth, or a choppier symbol.
+plotchar(showCandidates and anyShapeOkThisBar ? high : na, title = "Candidate B/C match (diagnostic, not a signal)", char = "•", location = location.abovebar, color = color.new(color.gray, 40), size = size.tiny)
 
 // ============================================================================
 // WORKED CHECKS — PRD §10, reproduced here so the arithmetic above is
