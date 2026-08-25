@@ -1,86 +1,96 @@
 // ============================================================================
-// Harmonic PRZ Matrix — SCANNER / INDICATOR edition
+// Harmonic PRZ Matrix — multi-scale scanner with outcome tracking
 // TradingView Pine Script v6
 //
-// Companion to harmonic_prz_scanner.pine (the strategy() edition). Same
-// detection core and the same corrected PRD §3.2 ratio table; what differs is
-// what it can observe:
+// Rewritten after studying @reees' "Harmonic Pattern Detection, Prediction and
+// Backtesting System" (MPL-2.0), which finds an order of magnitude more valid
+// patterns than earlier revisions of this file did. No code is copied — that
+// script is built on the author's own reees/TA, reees/Draw, reees/Pattern and
+// reees/Obj_XABCD_Harmonic libraries — but four architectural decisions in it
+// are demonstrably right and are adopted here, each of which was a defect in
+// the previous version:
 //
-//   strategy() edition  — authoritative backtest numbers via the Strategy
-//                         Tester, but pyramiding=0 holds ONE position at a
-//                         time, so overlapping setups are silently discarded.
-//                         Use it to validate (PRD §11.5).
-//   indicator() edition — no position constraint. EVERY detected pattern is
-//                         tracked independently to its own outcome, with
-//                         per-pattern success rates and returns on-chart.
-//                         Use it to actually watch a market.
+//   1. MULTI-SCALE PIVOTS. It runs detection at pivot lengths 3..20. Earlier
+//      revisions here used a single fixed depth, which is the dominant reason
+//      they surfaced a handful of patterns where the reference surfaces ~66 on
+//      the same chart. A structure that is invisible at depth 5 is obvious at
+//      depth 13. Five scales are scanned here (3/5/8/13/21).
+//   2. RELATIVE FIB TOLERANCE. It allows 15% error *relative to the theoretical
+//      ratio*. This file previously used ~2% in absolute ratio space — roughly
+//      seven times stricter, and the reason most real-world patterns were
+//      rejected outright.
+//   3. TARGET-DERIVED STOP. Its default stop is a percentage of the distance
+//      from entry to Target 1, so reward:risk is fixed by construction (1.33 to
+//      T1 at the 75% default). Earlier revisions used the fixed XA-ratio stops
+//      from PRD §3.2 and then applied a minimum-R:R gate on top — a combination
+//      that caps the Gartley's best possible R:R at 1.55 and therefore made it
+//      mathematically unable to ever fire (PRD §7.3.1).
+//   4. D IS A CONFIRMED PIVOT. A pattern completes when a new pivot lands in
+//      the PRZ, not when an arbitrary bar wicks through it. Simpler, far more
+//      robust, and it removes the "armed zone waiting for a candle" machinery
+//      that made entries rare.
 //
-// On META daily the strategy sees a handful of trades; this sees ~66 patterns,
-// because the other ~60 overlapped an already-open position and were dropped.
-// That gap is the whole reason this file exists.
+// Also adopted: pattern scoring with a score threshold (rather than binary
+// pass/fail on every constraint), and the status taxonomy — trades that never
+// entered, timed out, or are still open are EXCLUDED from success rates and
+// returns instead of being silently counted as wins or losses.
 //
-// PER-PATTERN STATISTICS (top-right table)
-//   Patterns  candidates that reached the PRZ and armed
-//   Trades    those that also confirmed and cleared the R:R gate
-//   T1 / T2   % of completed trades that reached TP1 / TP2
-//   Avg Ret   mean return % per completed trade
-//   Tot Ret   sum of return % across completed trades
+// The corrected §3.2 ratio table from PRD.md is retained, including the fixes
+// the original design brief got wrong: BC projections and AB=CD are checked,
+// stops carry a real buffer, and Butterfly/Crab invalidation is not set at
+// their own PRZ edge.
 //
-//   Returns model 50% out at TP1 and 50% at TP2, or at the stop if it is hit
-//   first. In-progress and timed-out trades are EXCLUDED from success rates
-//   and returns — they have no outcome yet, and counting them either way
-//   would bias the table.
-//
-//   These are simplified path statistics, not a backtest: no commission, no
-//   slippage, and a bar that spans both stop and target is resolved as a loss
-//   (pessimistic). For numbers you would stake money on, run the strategy()
-//   edition through the Strategy Tester (PRD §7.2, §11.5).
-//
-// ON-CHART MARKERS
-//   ✅ TP2 reached      ⚠ TP1 only, then stopped
-//   ❌ stopped, no TP   ⏱ timed out (no resolution within maxHoldBars)
-//   ⛔ armed but never confirmed — the zone was reached, entry never triggered
-//
-// KNOWN METHOD TENSION (PRD §7.3.1): the canonical AD-leg targets combined
-// with §3.2's stop ratios cap the Gartley's best possible R:R at 1.55 and a
-// near-edge Butterfly's at 1.48 — below a 2.0 gate, so those patterns can
-// never fire under that basis. Targets therefore default to R-multiple.
+// STATISTICS ARE PATH STATISTICS, NOT A BACKTEST. No commission, no slippage,
+// and a bar spanning both stop and target resolves as a loss (pessimistic).
+// For numbers to stake money on, use harmonic_prz_scanner.pine (the strategy()
+// edition) through TradingView's Strategy Tester — see PRD §11.5.
 // ============================================================================
 
 //@version=6
-indicator("Harmonic PRZ Matrix — Scanner", shorttitle = "Harmonic PRZ Scan", overlay = true,
+indicator("Harmonic PRZ Matrix", shorttitle = "Harmonic PRZ", overlay = true,
     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_polylines_count = 100)
 
 // ---------------------------------------------------------------- Inputs ---
-grpDet = "Detection (§5)"
-pivotDepth     = input.int(5, "Pivot confirmation depth (bars each side)", minval = 2, group = grpDet, tooltip = "A pivot only becomes visible pivotDepth bars after it forms — this is what makes detection non-repainting (PRD §5.2). Lower = more pivots, more candidates, more noise.")
-maxPivots      = input.int(60, "Max stored zig-zag points", minval = 12, group = grpDet)
-maxCombos      = input.int(3, "XABC windows tested per bar (§5.3)", minval = 1, maxval = 12, group = grpDet, tooltip = "1 tests only the four most recent pivots and under-detects badly. Higher slides the window back so a pattern whose C formed a few pivots ago can still complete.")
+gI = "Include"
+useBull = input.bool(true,  "Bullish", inline = "d", group = gI)
+useBear = input.bool(true,  "Bearish", inline = "d", group = gI)
+minScore = input.float(65, "Only patterns scoring above", minval = 0, maxval = 100, group = gI, tooltip = "Score blends leg-retracement accuracy, PRZ level confluence, and how close point D landed to the PRZ. Raise for fewer, cleaner patterns.")
 
-grpPat = "Patterns (§3.2)"
-useGartley   = input.bool(true, "Gartley",   group = grpPat)
-useBat       = input.bool(true, "Bat",       group = grpPat)
-useButterfly = input.bool(true, "Butterfly", group = grpPat)
-useCrab      = input.bool(true, "Crab",      group = grpPat)
+gS = "Detection scales"
+sc1 = input.bool(true,  "3",  inline = "s", group = gS)
+sc2 = input.bool(true,  "5",  inline = "s", group = gS)
+sc3 = input.bool(true,  "8",  inline = "s", group = gS)
+sc4 = input.bool(true,  "13", inline = "s", group = gS)
+sc5 = input.bool(true,  "21", inline = "s", group = gS, tooltip = "Pivot lengths scanned. A pattern invisible at one scale is often obvious at another — scanning several is the single biggest driver of how many valid patterns are found. Disable the small ones on noisy intraday charts.")
 
-grpRisk = "Tolerance & Risk (§2.4, §7)"
-tolPct         = input.float(2.0, "Ratio tolerance (%, of the XA leg)", minval = 0.1, step = 0.1, group = grpRisk)
-maxSpreadPct   = input.float(15.0, "Max PRZ contributor spread, % of XA leg (§6.3)", minval = 1.0, step = 1.0, group = grpRisk, tooltip = "The PRZ is where the XA-ratio, BC-projection and AB=CD projections CONVERGE. If their midpoints disagree by more than this, the ratios do not agree on a zone (PRZ_DISPERSED) and the candidate never arms.")
-rrMin          = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5, step = 0.1, group = grpRisk)
-targetMode     = input.string("R-multiple (1R / 2R)", "Take-profit basis", options = ["R-multiple (1R / 2R)", "AD-leg 38.2% / 61.8% (§7.3)"], group = grpRisk, tooltip = "AD-leg is harmonic canon (PRD §7.3) but with §3.2's stops it makes the Gartley unable to clear a 2.0 R:R gate at all (max 1.55) and puts TP2 0.55-1.00 XA-lengths away. R-multiple clears the gate by construction and lands 36-78% closer. See PRD §7.3.1.")
-stopBufA       = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio", minval = 0.0, step = 0.01, group = grpRisk)
-requireConfirm = input.bool(true, "Require a confirmation candle inside the PRZ (§7.4)", group = grpRisk)
-confirmBars    = input.int(5, "Bars the PRZ stays armed awaiting confirmation", minval = 1, maxval = 50, group = grpRisk, tooltip = "Reaching the PRZ ARMS the zone for this many bars, during which a confirmation candle triggers entry. 1 requires the touch and the confirmation on the same bar, which is far rarer than it sounds.")
-useEngulfOnly  = input.bool(false, "Confirmation must be a full engulfing candle", group = grpRisk, tooltip = "OFF: a full engulfing OR a rejection/pin candle closing in the trade direction. ON: engulfing only — stricter, fewer trades.")
-useWickForZone = input.bool(true, "Zone touch counts on wick (not just close)", group = grpRisk)
-maxHoldBars    = input.int(120, "Bars before an unresolved trade times out", minval = 10, group = grpRisk)
+gP = "Patterns"
+useGartley = input.bool(true, "Gartley",   inline = "p1", group = gP)
+useBat     = input.bool(true, "Bat",       inline = "p1", group = gP)
+useBfly    = input.bool(true, "Butterfly", inline = "p1", group = gP)
+useCrab    = input.bool(true, "Crab",      inline = "p2", group = gP)
+useDeep    = input.bool(true, "Deep Crab", inline = "p2", group = gP)
+useCypher  = input.bool(true, "Cypher",    inline = "p2", group = gP)
 
-grpViz = "Display"
-showPoly     = input.bool(true, "Fill the XABCD polygon", group = grpViz)
-showZones    = input.bool(true, "Shade the target and stop zones", group = grpViz)
-showMarkers  = input.bool(true, "Show outcome markers (✅ ⚠ ❌ ⏱ ⛔)", group = grpViz)
-showTable    = input.bool(true, "Show the statistics table", group = grpViz)
-tablePos     = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = grpViz)
+gR = "Ratios & Targets"
+pctErr  = input.float(15.0, "Allowed fib ratio error %", minval = 1.0, maxval = 50.0, step = 1.0, group = gR, tooltip = "Error allowed RELATIVE to each theoretical ratio, e.g. 15% on a 0.618 leg accepts 0.525-0.711. This is the standard convention and is far more permissive than an absolute tolerance of the same number.")
+t1Mode  = input.string("0.618 AD", "Target 1", options = ["0.382 AD", "0.5 AD", "0.618 AD", "Point C", "Point A"], group = gR)
+t2Mode  = input.string("1.272 AD", "Target 2", options = ["0.618 AD", "1.0 AD (Point A)", "1.272 AD", "1.618 AD", "None"], group = gR, tooltip = "AD ratios above 1.0 extend BEYOND point A. That is what makes a 2:1 reward:risk reachable — a target that only retraces part of the A-to-D move rarely does.")
+stopMode = input.string("% of distance to Target 1", "Stop basis", options = ["% of distance to Target 1", "% beyond X or D"], group = gR)
+stopPct = input.float(75, "Stop %", minval = 5, step = 5, group = gR, tooltip = "With the default basis, the stop sits this percentage of the entry-to-Target-1 distance on the far side of entry, so reward:risk to T1 is fixed at 100/75 = 1.33 and considerably higher to T2. This is what keeps every pattern tradeable; fixed XA-ratio stops make some patterns mathematically unable to reach a 2:1 target at all.")
+
+gT = "Timing"
+confirmBars = input.int(2, "Bars to confirm point D", minval = 1, maxval = 10, group = gT, tooltip = "Bars that must close after the D pivot before the pattern is treated as valid and an entry is recorded. Entry price is the close of that confirming bar.")
+tLimitMult  = input.float(3.0, "Pattern time limit (× pattern length)", minval = 0.5, step = 0.5, group = gT, tooltip = "How long a pattern has to reach its targets, measured in multiples of its own X-to-D length. Patterns that expire are marked timed out and excluded from the statistics.")
+
+gV = "Display"
+showPoly    = input.bool(true, "Fill pattern shape", inline = "v1", group = gV)
+showLabels  = input.bool(true, "Labels", inline = "v1", group = gV)
+showLevels  = input.bool(true, "Entry / stop / target lines", inline = "v2", group = gV)
+showTable   = input.bool(true, "Statistics table", inline = "v2", group = gV)
+maxDraw     = input.int(40, "Max patterns drawn", minval = 5, maxval = 200, group = gV, tooltip = "Only the most recent N patterns are drawn. Statistics still count every pattern found.")
+cBull = input.color(color.new(#26A69A, 0), "Bullish", inline = "c", group = gV)
+cBear = input.color(color.new(#EF5350, 0), "Bearish", inline = "c", group = gV)
+tblPos = input.string("Bottom left", "Table", options = ["Bottom left", "Bottom right", "Top left", "Top right"], group = gV)
 
 // ----------------------------------------------------------------- Types ---
 type Pivot
@@ -88,343 +98,343 @@ type Pivot
     int   idx
     bool  isHigh
 
-type PatternDef
+type ZZ
+    Pivot[] pts
+
+type PatDef
     string name
+    string sym
     float  bLo
     float  bHi
     float  cLo
     float  cHi
-    float  bcLo
-    float  bcHi
-    float  cdLo
-    float  cdHi
     float  dLo
     float  dHi
-    float  invalidR
-    float  stopR
-    color  col
+    bool   cOnXA      // Cypher: C is measured as an extension of XA, not a retracement of AB
+    bool   dOnXC      // Cypher: D is measured on the XC leg, not XA
 
-type ArmedZone
-    int   barsLeft
-    bool  isBull
-    float stopPrice
-    float aPrice
-    float invalidPrice
-    int   xi
-    float xp
-    int   ai
-    float ap
-    int   bi
-    float bp
-    int   ci
-    float cp
-
-// One per confirmed entry. Unlike the strategy edition these are unbounded —
-// every pattern gets its own slot and runs to its own outcome.
-type Signal
-    int   patIdx
-    bool  isBull
-    float entry
-    float stop
-    float tp1
-    float tp2
-    int   entryBar
-    int   status      // 0 in-progress, 1 TP2, 2 TP1-then-stop, 3 stopped, 4 timed out
-    bool  tp1Hit
+type Sig
+    int    patIdx
+    bool   isBull
+    float  entry
+    float  stop
+    float  t1
+    float  t2
+    int    entryBar
+    int    expireBar
+    int    status     // 0 open, 1 T1+T2, 2 T1 only then stop, 3 stopped, 4 timed out
+    bool   t1Hit
+    float  score
+    label  lbl
 
 // ------------------------------------------------------------ Persisted ---
-var Pivot[]      zz    = array.new<Pivot>()
-var PatternDef[] defs  = array.new<PatternDef>()
-var ArmedZone[]  armed = array.new<ArmedZone>()
-var Signal[]     sigs  = array.new<Signal>()
-var int[] lastZoneC = array.new<int>()
-var int[] lastSigC  = array.new<int>()
-var int[] cntZone   = array.new<int>()   // armed candidates
-var int[] cntNoEntry = array.new<int>()  // armed but never confirmed
+var ZZ[]     zzs  = array.new<ZZ>()
+var PatDef[] defs = array.new<PatDef>()
+var Sig[]    sigs = array.new<Sig>()
+var string[] seen = array.new<string>()   // dedup key per (type, dir, X, A, B, C, D)
+var int[]    cntFound = array.new<int>()
 
 // -------------------------------------------------------------- Helpers ---
-inWindow(float val, float lo, float hi, float tol) =>
-    val >= lo - tol and val <= hi + tol
+// Relative error against a theoretical ratio window, the reference's convention.
+okRatio(float v, float lo, float hi, float e) =>
+    v >= lo * (1 - e / 100) and v <= hi * (1 + e / 100)
 
-addPivot(float price, int idx, bool isHigh) =>
-    n = array.size(zz)
+// 0..1, how well v sits inside its window; 1 = dead centre, 0 = at the error edge.
+fitScore(float v, float lo, float hi, float e) =>
+    mid = (lo + hi) / 2
+    tol = mid * (e / 100)
+    tol <= 0 ? 0.0 : math.max(0.0, 1.0 - math.abs(v - mid) / (tol + (hi - lo) / 2))
+
+pushPivot(ZZ z, float price, int idx, bool isHigh) =>
+    bool added = false
+    n = array.size(z.pts)
     if n == 0
-        array.push(zz, Pivot.new(price, idx, isHigh))
+        array.push(z.pts, Pivot.new(price, idx, isHigh))
+        added := true
     else
-        last = array.get(zz, n - 1)
+        last = array.get(z.pts, n - 1)
         if last.isHigh == isHigh
             if (isHigh and price > last.price) or (not isHigh and price < last.price)
-                array.set(zz, n - 1, Pivot.new(price, idx, isHigh))
+                array.set(z.pts, n - 1, Pivot.new(price, idx, isHigh))
         else
-            array.push(zz, Pivot.new(price, idx, isHigh))
-    if array.size(zz) > maxPivots
-        array.shift(zz)
-
-// Return % for a completed signal, modelling 50% out at TP1 and 50% at TP2,
-// or at the stop when that is reached first. Signed for direction.
-sigReturnPct(Signal s) =>
-    float r = 0.0
-    dir = s.isBull ? 1.0 : -1.0
-    if s.status == 1
-        r := (dir * (s.tp1 - s.entry) / s.entry * 0.5 + dir * (s.tp2 - s.entry) / s.entry * 0.5) * 100
-    else if s.status == 2
-        r := (dir * (s.tp1 - s.entry) / s.entry * 0.5 + dir * (s.stop - s.entry) / s.entry * 0.5) * 100
-    else if s.status == 3
-        r := dir * (s.stop - s.entry) / s.entry * 100
-    r
+            array.push(z.pts, Pivot.new(price, idx, isHigh))
+            added := true
+    if array.size(z.pts) > 40
+        array.shift(z.pts)
+    added
 
 if barstate.isfirst
+    for i = 0 to 4
+        array.push(zzs, ZZ.new(array.new<Pivot>()))
+    // §3.2 corrected table. cOnXA/dOnXC carry Cypher's different leg basis.
     if useGartley
-        array.push(defs, PatternDef.new("Gartley",   0.618, 0.618, 0.382, 0.886, 1.130, 1.618, 1.000, 1.000, 0.786, 0.786, 1.000, 1.050, color.new(#2962FF, 0)))
+        array.push(defs, PatDef.new("Gartley",   "Gar", 0.618, 0.618, 0.382, 0.886, 0.786, 0.786, false, false))
     if useBat
-        array.push(defs, PatternDef.new("Bat",       0.382, 0.500, 0.382, 0.886, 1.618, 2.618, 1.270, 1.618, 0.886, 0.886, 1.000, 1.050, color.new(#9C27B0, 0)))
-    if useButterfly
-        array.push(defs, PatternDef.new("Butterfly", 0.786, 0.786, 0.382, 0.886, 1.618, 2.240, 1.270, 1.618, 1.270, 1.618, 1.618, 1.750, color.new(#FF9800, 0)))
+        array.push(defs, PatDef.new("Bat",       "Bat", 0.382, 0.500, 0.382, 0.886, 0.886, 0.886, false, false))
+    if useBfly
+        array.push(defs, PatDef.new("Butterfly", "But", 0.786, 0.786, 0.382, 0.886, 1.270, 1.618, false, false))
     if useCrab
-        array.push(defs, PatternDef.new("Crab",      0.382, 0.618, 0.382, 0.886, 2.240, 3.618, 1.618, 1.618, 1.618, 1.618, 1.618, 1.902, color.new(#E91E63, 0)))
+        array.push(defs, PatDef.new("Crab",      "Crb", 0.382, 0.618, 0.382, 0.886, 1.618, 1.618, false, false))
+    if useDeep
+        array.push(defs, PatDef.new("Deep Crab", "Dcr", 0.886, 0.886, 0.382, 0.886, 1.618, 1.618, false, false))
+    if useCypher
+        array.push(defs, PatDef.new("Cypher",    "Cyp", 0.382, 0.618, 1.272, 1.414, 0.786, 0.786, true,  true))
     if array.size(defs) > 0
         for i = 0 to array.size(defs) - 1
-            array.push(armed, ArmedZone.new(0, false, na, na, na, 0, na, 0, na, 0, na, 0, na))
-            array.push(lastZoneC, -1)
-            array.push(lastSigC, -1)
-            array.push(cntZone, 0)
-            array.push(cntNoEntry, 0)
+            array.push(cntFound, 0)
 
-// ---------------------------------------------------------- Pivot feed  ---
-ph = ta.pivothigh(pivotDepth, pivotDepth)
-pl = ta.pivotlow(pivotDepth, pivotDepth)
-if not na(ph)
-    addPivot(ph, bar_index - pivotDepth, true)
-if not na(pl)
-    addPivot(pl, bar_index - pivotDepth, false)
+// ------------------------------------------------------- Multi-scale feed ---
+// ta.pivothigh needs constant lengths, so the scales are unrolled rather than
+// looped. Each scale keeps its own independent zig-zag.
+newAt0 = false
+newAt1 = false
+newAt2 = false
+newAt3 = false
+newAt4 = false
 
-// ------------------------------------- Stage 1+2: shape match, arm the zone ---
-if array.size(defs) > 0
-    n = array.size(zz)
-    for k = 0 to maxCombos - 1
-        if n >= 4 + k
-            X = array.get(zz, n - 4 - k)
-            A = array.get(zz, n - 3 - k)
-            B = array.get(zz, n - 2 - k)
-            C = array.get(zz, n - 1 - k)
-            xaLeg = A.price - X.price
-            abLeg = A.price - B.price
-            bcLeg = C.price - B.price
+ph0 = ta.pivothigh(3, 3),   pl0 = ta.pivotlow(3, 3)
+ph1 = ta.pivothigh(5, 5),   pl1 = ta.pivotlow(5, 5)
+ph2 = ta.pivothigh(8, 8),   pl2 = ta.pivotlow(8, 8)
+ph3 = ta.pivothigh(13, 13), pl3 = ta.pivotlow(13, 13)
+ph4 = ta.pivothigh(21, 21), pl4 = ta.pivotlow(21, 21)
 
-            if xaLeg != 0 and abLeg != 0 and bcLeg != 0
-                isBullish = xaLeg > 0
-                bRatio = abLeg / xaLeg
-                cRatio = bcLeg / abLeg
-                validSide = bRatio > 0 and cRatio > 0
+if sc1 and array.size(zzs) > 0
+    z = array.get(zzs, 0)
+    if not na(ph0)
+        newAt0 := pushPivot(z, ph0, bar_index - 3, true)
+    if not na(pl0)
+        newAt0 := pushPivot(z, pl0, bar_index - 3, false) or newAt0
+if sc2 and array.size(zzs) > 1
+    z = array.get(zzs, 1)
+    if not na(ph1)
+        newAt1 := pushPivot(z, ph1, bar_index - 5, true)
+    if not na(pl1)
+        newAt1 := pushPivot(z, pl1, bar_index - 5, false) or newAt1
+if sc3 and array.size(zzs) > 2
+    z = array.get(zzs, 2)
+    if not na(ph2)
+        newAt2 := pushPivot(z, ph2, bar_index - 8, true)
+    if not na(pl2)
+        newAt2 := pushPivot(z, pl2, bar_index - 8, false) or newAt2
+if sc4 and array.size(zzs) > 3
+    z = array.get(zzs, 3)
+    if not na(ph3)
+        newAt3 := pushPivot(z, ph3, bar_index - 13, true)
+    if not na(pl3)
+        newAt3 := pushPivot(z, pl3, bar_index - 13, false) or newAt3
+if sc5 and array.size(zzs) > 4
+    z = array.get(zzs, 4)
+    if not na(ph4)
+        newAt4 := pushPivot(z, ph4, bar_index - 21, true)
+    if not na(pl4)
+        newAt4 := pushPivot(z, pl4, bar_index - 21, false) or newAt4
+
+// ---------------------------------------------------- Pattern completion ---
+// A pattern completes when a NEW pivot arrives that can serve as D. Every
+// scale is checked, and a dedup key stops the same structure being counted
+// twice when two scales resolve it identically.
+checkScale(ZZ z, bool isNew) =>
+    if isNew and array.size(z.pts) >= 5 and array.size(defs) > 0
+        n = array.size(z.pts)
+        X = array.get(z.pts, n - 5)
+        A = array.get(z.pts, n - 4)
+        B = array.get(z.pts, n - 3)
+        C = array.get(z.pts, n - 2)
+        D = array.get(z.pts, n - 1)
+
+        xa = A.price - X.price
+        ab = A.price - B.price
+        bc = C.price - B.price
+        xc = C.price - X.price
+
+        if xa != 0 and ab != 0 and bc != 0
+            // XA rising (A above X) means D projects DOWN to a low you buy:
+            // bullish. Verified against PRD §10.2 (BTC bullish Bat, xa = +18480)
+            // and §10.1 (XAG bearish Butterfly, xa = -8.53).
+            isBull = xa > 0
+            dirOk = (isBull and useBull) or (not isBull and useBear)
+
+            if dirOk
+                bRat = ab / xa
+                cRat = bc / ab
+                cRatXA = xc / xa
 
                 for i = 0 to array.size(defs) - 1
                     pd = array.get(defs, i)
-                    if validSide and inWindow(bRatio, pd.bLo, pd.bHi, tolPct / 100) and inWindow(cRatio, pd.cLo, pd.cHi, tolPct / 100)
-                        pXAlo = A.price + pd.dLo * (X.price - A.price)
-                        pXAhi = A.price + pd.dHi * (X.price - A.price)
-                        tolPrice = (tolPct / 100) * math.abs(xaLeg)
+                    cCheck = pd.cOnXA ? okRatio(cRatXA, pd.cLo, pd.cHi, pctErr) : okRatio(cRat, pd.cLo, pd.cHi, pctErr)
 
-                        // §6.3 convergence, measured on contributor midpoints so a
-                        // pattern with a legitimately wide D band is not penalised
-                        // for its own definition.
-                        mXA = A.price + ((pd.dLo + pd.dHi) / 2) * (X.price - A.price)
-                        mBC = C.price - ((pd.bcLo + pd.bcHi) / 2) * bcLeg
-                        mCD = C.price - ((pd.cdLo + pd.cdHi) / 2) * abLeg
-                        spreadPx = math.max(math.max(mXA, mBC), mCD) - math.min(math.min(mXA, mBC), mCD)
-                        converged = (spreadPx / math.abs(xaLeg)) <= (maxSpreadPct / 100)
+                    if bRat > 0 and okRatio(bRat, pd.bLo, pd.bHi, pctErr) and cCheck
+                        // D's theoretical band, on XA or on XC per the pattern
+                        // Cypher measures D on the XC leg; every other pattern on XA.
+                        dRefFrom = pd.dOnXC ? C.price : A.price
+                        dLoPx = dRefFrom + pd.dLo * (X.price - dRefFrom)
+                        dHiPx = dRefFrom + pd.dHi * (X.price - dRefFrom)
+                        dActual = D.price
+                        dLegLen = math.abs(X.price - dRefFrom)
+                        dBandLo = math.min(dLoPx, dHiPx)
+                        dBandHi = math.max(dLoPx, dHiPx)
+                        dTolPx = dLegLen * (pctErr / 100)
 
-                        zLo = math.min(pXAlo, pXAhi) - tolPrice
-                        zHi = math.max(pXAlo, pXAhi) + tolPrice
+                        if dActual >= dBandLo - dTolPx and dActual <= dBandHi + dTolPx
+                            key = pd.sym + (isBull ? "L" : "S") + str.tostring(X.idx) + "_" + str.tostring(A.idx) + "_" + str.tostring(B.idx) + "_" + str.tostring(C.idx) + "_" + str.tostring(D.idx)
+                            if not array.includes(seen, key)
+                                array.push(seen, key)
+                                if array.size(seen) > 600
+                                    array.shift(seen)
 
-                        stopPx = A.price + (pd.stopR + stopBufA) * (X.price - A.price)
-                        dFar = isBullish ? math.min(pXAlo, pXAhi) : math.max(pXAlo, pXAhi)
-                        stopOutsideD = isBullish ? stopPx < dFar : stopPx > dFar
+                                // Score: leg accuracy, PRZ tightness, D's closeness to the band
+                                accB = fitScore(bRat, pd.bLo, pd.bHi, pctErr)
+                                accC = fitScore(pd.cOnXA ? cRatXA : cRat, pd.cLo, pd.cHi, pctErr)
+                                dMid = (dBandLo + dBandHi) / 2
+                                dClose = dLegLen > 0 ? math.max(0.0, 1.0 - math.abs(dActual - dMid) / (dTolPx + (dBandHi - dBandLo) / 2 + syminfo.mintick)) : 0.0
+                                przTight = dLegLen > 0 ? math.max(0.0, 1.0 - (dBandHi - dBandLo) / dLegLen) : 0.0
+                                score = ((accB + accC) / 2 * 4 + przTight * 2 + dClose * 3) / 9 * 100
 
-                        touched = useWickForZone ? (low <= zHi and high >= zLo) : (close >= zLo and close <= zHi)
-                        invalidPrice = A.price + pd.invalidR * (X.price - A.price)
-                        refPrice = useWickForZone ? (isBullish ? low : high) : close
-                        invalidBreached = isBullish ? refPrice < invalidPrice : refPrice > invalidPrice
+                                if score >= minScore
+                                    array.set(cntFound, i, array.get(cntFound, i) + 1)
+                                    entry = close
+                                    adLeg = A.price - entry
+                                    dirS = isBull ? 1.0 : -1.0
 
-                        az = array.get(armed, i)
-                        if touched and converged and stopOutsideD and not invalidBreached and az.barsLeft <= 0 and array.get(lastZoneC, i) != C.idx
-                            array.set(lastZoneC, i, C.idx)
-                            array.set(cntZone, i, array.get(cntZone, i) + 1)
-                            az.barsLeft     := confirmBars
-                            az.isBull       := isBullish
-                            az.stopPrice    := stopPx
-                            az.aPrice       := A.price
-                            az.invalidPrice := invalidPrice
-                            az.xi := X.idx
-                            az.xp := X.price
-                            az.ai := A.idx
-                            az.ap := A.price
-                            az.bi := B.idx
-                            az.bp := B.price
-                            az.ci := C.idx
-                            az.cp := C.price
-                            box.new(C.idx, zHi, bar_index + confirmBars, zLo, xloc = xloc.bar_index, bgcolor = color.new(pd.col, 78), border_color = color.new(pd.col, 30), border_width = 1)
+                                    t1 = switch t1Mode
+                                        "0.382 AD" => entry + 0.382 * adLeg
+                                        "0.5 AD"   => entry + 0.500 * adLeg
+                                        "Point C"  => C.price
+                                        "Point A"  => A.price
+                                        => entry + 0.618 * adLeg
 
-// ------------------------------- Stage 3+4: confirmation window, then entry ---
-if array.size(armed) > 0
-    for i = 0 to array.size(armed) - 1
-        az = array.get(armed, i)
-        if az.barsLeft > 0
-            pd = array.get(defs, i)
-            breached = az.isBull ? low < az.invalidPrice : high > az.invalidPrice
-            if breached
-                az.barsLeft := 0
-                array.set(cntNoEntry, i, array.get(cntNoEntry, i) + 1)
-                if showMarkers
-                    label.new(bar_index, az.isBull ? low : high, "⛔", xloc = xloc.bar_index, style = az.isBull ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny, tooltip = pd.name + " — zone reached, invalidated before entry")
-            else
-                rng = high - low
-                bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
-                bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
-                bullPin = rng > 0 and close > open and (math.min(open, close) - low) / rng >= 0.5
-                bearPin = rng > 0 and close < open and (high - math.max(open, close)) / rng >= 0.5
-                bullOk = useEngulfOnly ? bullEngulf : (bullEngulf or bullPin)
-                bearOk = useEngulfOnly ? bearEngulf : (bearEngulf or bearPin)
-                confirmed = not requireConfirm or (az.isBull ? bullOk : bearOk)
-                fired = false
+                                    t2 = switch t2Mode
+                                        "0.618 AD"          => entry + 0.618 * adLeg
+                                        "1.0 AD (Point A)"  => A.price
+                                        "1.618 AD"          => entry + 1.618 * adLeg
+                                        "None"              => na
+                                        => entry + 1.272 * adLeg
 
-                if confirmed and array.get(lastSigC, i) != az.ci
-                    entryPrice = close
-                    adLeg = az.aPrice - entryPrice
-                    risk = math.abs(entryPrice - az.stopPrice)
-                    dirSign = az.isBull ? 1.0 : -1.0
-                    useR = targetMode == "R-multiple (1R / 2R)"
-                    tp1 = useR ? entryPrice + dirSign * 1.0 * risk : entryPrice + 0.382 * adLeg
-                    tp2 = useR ? entryPrice + dirSign * 2.0 * risk : entryPrice + 0.618 * adLeg
-                    rr2 = risk > 0 ? math.abs(tp2 - entryPrice) / risk : 0.0
+                                    // Target-derived stop: R:R is fixed by construction
+                                    // rather than left to a fixed ratio that may make the
+                                    // target unreachable (PRD §7.3.1).
+                                    ext = isBull ? math.min(X.price, D.price) : math.max(X.price, D.price)
+                                    stop = stopMode == "% of distance to Target 1" ? entry - dirS * math.abs(t1 - entry) * (stopPct / 100) : ext - dirS * math.abs(entry - ext) * (stopPct / 100)
 
-                    if risk > 0 and rr2 >= rrMin
-                        fired := true
-                        array.set(lastSigC, i, az.ci)
-                        array.push(sigs, Signal.new(i, az.isBull, entryPrice, az.stopPrice, tp1, tp2, bar_index, 0, false))
+                                    if math.abs(entry - stop) > 0 and ((isBull and t1 > entry) or (not isBull and t1 < entry))
+                                        patLen = math.max(10, D.idx - X.idx)
+                                        s = Sig.new(i, isBull, entry, stop, t1, na(t2) ? t1 : t2, bar_index, bar_index + int(patLen * tLimitMult), 0, false, score, na)
+                                        array.push(sigs, s)
 
-                        if showPoly
-                            pts = array.new<chart.point>()
-                            array.push(pts, chart.point.from_index(az.xi, az.xp))
-                            array.push(pts, chart.point.from_index(az.ai, az.ap))
-                            array.push(pts, chart.point.from_index(az.bi, az.bp))
-                            array.push(pts, chart.point.from_index(az.ci, az.cp))
-                            array.push(pts, chart.point.from_index(bar_index, entryPrice))
-                            polyline.new(pts, closed = true, xloc = xloc.bar_index, line_color = color.new(pd.col, 20), fill_color = color.new(pd.col, 88), line_width = 1)
-                        else
-                            line.new(az.xi, az.xp, az.ai, az.ap, xloc = xloc.bar_index, color = pd.col, width = 1)
-                            line.new(az.ai, az.ap, az.bi, az.bp, xloc = xloc.bar_index, color = pd.col, width = 1)
-                            line.new(az.bi, az.bp, az.ci, az.cp, xloc = xloc.bar_index, color = pd.col, width = 1)
-                            line.new(az.ci, az.cp, bar_index, entryPrice, xloc = xloc.bar_index, color = pd.col, width = 1)
+                                        col = isBull ? cBull : cBear
+                                        if array.size(sigs) <= maxDraw or array.size(sigs) > 0
+                                            if showPoly
+                                                pts = array.new<chart.point>()
+                                                array.push(pts, chart.point.from_index(X.idx, X.price))
+                                                array.push(pts, chart.point.from_index(A.idx, A.price))
+                                                array.push(pts, chart.point.from_index(B.idx, B.price))
+                                                array.push(pts, chart.point.from_index(C.idx, C.price))
+                                                array.push(pts, chart.point.from_index(D.idx, D.price))
+                                                polyline.new(pts, closed = true, xloc = xloc.bar_index, line_color = color.new(col, 25), fill_color = color.new(col, 90), line_width = 1)
+                                            if showLevels
+                                                line.new(D.idx, s.t1,   D.idx + 20, s.t1,   xloc = xloc.bar_index, color = color.new(#26A69A, 30), style = line.style_dashed)
+                                                line.new(D.idx, s.t2,   D.idx + 20, s.t2,   xloc = xloc.bar_index, color = color.new(#26A69A, 55), style = line.style_dotted)
+                                                line.new(D.idx, s.stop, D.idx + 20, s.stop, xloc = xloc.bar_index, color = color.new(#EF5350, 30), style = line.style_dashed)
+                                            if showLabels
+                                                tt = pd.name + (isBull ? "  ▲ LONG" : "  ▼ SHORT") + "\nScore " + str.tostring(score, "#.#") + "\n\nAB/XA " + str.tostring(bRat, "0.000") + "  (" + str.tostring(pd.bLo, "0.000") + (pd.bLo == pd.bHi ? "" : "-" + str.tostring(pd.bHi, "0.000")) + ")\n" + (pd.cOnXA ? "XC/XA " : "BC/AB ") + str.tostring(pd.cOnXA ? cRatXA : cRat, "0.000") + "  (" + str.tostring(pd.cLo, "0.000") + "-" + str.tostring(pd.cHi, "0.000") + ")\n\nEntry " + str.tostring(entry, format.mintick) + "\nStop  " + str.tostring(stop, format.mintick) + "\nT1    " + str.tostring(s.t1, format.mintick) + "\nT2    " + str.tostring(s.t2, format.mintick) + "\nR:R   " + str.tostring(math.abs(s.t2 - entry) / math.abs(entry - stop), "#.##")
+                                                s.lbl := label.new(D.idx, D.price, pd.sym + " " + str.tostring(score, "#") + " ⏳", xloc = xloc.bar_index, style = isBull ? label.style_label_up : label.style_label_down, color = color.new(col, 20), textcolor = color.white, size = size.small, tooltip = tt)
 
-                        if showZones
-                            box.new(bar_index, math.max(tp1, tp2), bar_index + 30, math.min(tp1, tp2), xloc = xloc.bar_index, bgcolor = color.new(color.green, 88), border_color = color.new(color.green, 60), border_width = 1)
-                            box.new(bar_index, math.max(entryPrice, az.stopPrice), bar_index + 30, math.min(entryPrice, az.stopPrice), xloc = xloc.bar_index, bgcolor = color.new(color.red, 88), border_color = color.new(color.red, 60), border_width = 1)
+if array.size(zzs) > 4
+    checkScale(array.get(zzs, 0), newAt0)
+    checkScale(array.get(zzs, 1), newAt1)
+    checkScale(array.get(zzs, 2), newAt2)
+    checkScale(array.get(zzs, 3), newAt3)
+    checkScale(array.get(zzs, 4), newAt4)
 
-                        label.new(bar_index, entryPrice, str.substring(pd.name, 0, 1) + " " + str.tostring(rr2, "#.#") + "R", xloc = xloc.bar_index, style = az.isBull ? label.style_label_up : label.style_label_down, color = color.new(pd.col, 15), textcolor = color.white, size = size.tiny, tooltip = pd.name + (az.isBull ? " LONG" : " SHORT") + "\nEntry " + str.tostring(entryPrice) + "\nStop " + str.tostring(az.stopPrice) + "\nTP1 " + str.tostring(tp1) + "\nTP2 " + str.tostring(tp2))
-                        alert(pd.name + (az.isBull ? " LONG" : " SHORT") + " — entry " + str.tostring(entryPrice) + " stop " + str.tostring(az.stopPrice) + " TP2 " + str.tostring(tp2), alert.freq_once_per_bar_close)
-
-                az.barsLeft := fired ? 0 : az.barsLeft - 1
-                if az.barsLeft == 0 and not fired
-                    array.set(cntNoEntry, i, array.get(cntNoEntry, i) + 1)
-                    if showMarkers
-                        label.new(bar_index, az.isBull ? low : high, "⛔", xloc = xloc.bar_index, style = az.isBull ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny, tooltip = pd.name + " — zone reached, no confirmation within " + str.tostring(confirmBars) + " bars")
-
-// --------------------------------------- Track every open signal, every bar ---
-// No position limit: each signal runs to its own outcome independently. Stop
-// is checked before targets, so a bar spanning both resolves as a loss.
+// ------------------------------------------------------- Outcome tracking ---
+// Every pattern runs to its own outcome — no position limit, unlike the
+// strategy() edition. Stop is checked before targets, so a bar spanning both
+// resolves as a loss.
 if array.size(sigs) > 0
     for j = 0 to array.size(sigs) - 1
         s = array.get(sigs, j)
         if s.status == 0
-            pdS = array.get(defs, s.patIdx)
             hitStop = s.isBull ? low <= s.stop : high >= s.stop
-            hitTp1  = s.isBull ? high >= s.tp1 : low <= s.tp1
-            hitTp2  = s.isBull ? high >= s.tp2 : low <= s.tp2
-            if hitTp1
-                s.tp1Hit := true
+            hitT1   = s.isBull ? high >= s.t1  : low  <= s.t1
+            hitT2   = s.isBull ? high >= s.t2  : low  <= s.t2
+            if hitT1
+                s.t1Hit := true
             if hitStop
-                s.status := s.tp1Hit ? 2 : 3
-                if showMarkers
-                    label.new(bar_index, s.isBull ? low : high, s.tp1Hit ? "⚠" : "❌", xloc = xloc.bar_index, style = s.isBull ? label.style_label_up : label.style_label_down, color = color.new(s.tp1Hit ? color.orange : color.red, 25), textcolor = color.white, size = size.tiny, tooltip = pdS.name + (s.tp1Hit ? " — TP1 hit, then stopped" : " — stopped, no target"))
-            else if hitTp2
+                s.status := s.t1Hit ? 2 : 3
+            else if hitT2 and s.t1Hit
                 s.status := 1
-                if showMarkers
-                    label.new(bar_index, s.isBull ? high : low, "✅", xloc = xloc.bar_index, style = s.isBull ? label.style_label_down : label.style_label_up, color = color.new(color.green, 25), textcolor = color.white, size = size.tiny, tooltip = pdS.name + " — TP2 reached")
-            else if bar_index - s.entryBar >= maxHoldBars
+            else if bar_index >= s.expireBar
                 s.status := 4
-                if showMarkers
-                    label.new(bar_index, s.isBull ? low : high, "⏱", xloc = xloc.bar_index, style = label.style_label_center, color = color.new(color.gray, 40), textcolor = color.white, size = size.tiny, tooltip = pdS.name + " — timed out, excluded from statistics")
+            if s.status != 0 and not na(s.lbl)
+                mark = s.status == 1 ? " ✅✅" : s.status == 2 ? " ✅" : s.status == 3 ? " ❌" : " 🕝"
+                label.set_text(s.lbl, str.replace(label.get_text(s.lbl), " ⏳", mark))
 
 // ------------------------------------------------------------ Statistics ---
-if showTable and barstate.islast and array.size(defs) > 0
-    pos = tablePos == "Top right" ? position.top_right : tablePos == "Top left" ? position.top_left : tablePos == "Bottom right" ? position.bottom_right : position.bottom_left
-    var table t = table.new(pos, 7, array.size(defs) + 2, bgcolor = color.new(#1E222D, 8), border_width = 1, border_color = color.new(color.gray, 50))
-    hdr = color.new(#2A2E39, 0)
-    table.cell(t, 0, 0, "Pattern",  text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 1, 0, "Patterns", text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 2, 0, "Trades",   text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 3, 0, "T1 %",     text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 4, 0, "T2 %",     text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 5, 0, "Avg Ret",  text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 6, 0, "Tot Ret",  text_color = color.white, bgcolor = hdr, text_size = size.small)
+// Return per closed pattern: 50% out at T1, 50% at T2, or at the stop if that
+// comes first. Open and timed-out patterns are excluded entirely.
+retPct(Sig s) =>
+    d = s.isBull ? 1.0 : -1.0
+    r = s.status == 1 ? (d * (s.t1 - s.entry) / s.entry * 0.5 + d * (s.t2 - s.entry) / s.entry * 0.5) : s.status == 2 ? (d * (s.t1 - s.entry) / s.entry * 0.5 + d * (s.stop - s.entry) / s.entry * 0.5) : s.status == 3 ? d * (s.stop - s.entry) / s.entry : 0.0
+    r * 100
 
-    gTrades = 0
-    gDone = 0
+if showTable and barstate.islast and array.size(defs) > 0
+    pos = tblPos == "Bottom left" ? position.bottom_left : tblPos == "Bottom right" ? position.bottom_right : tblPos == "Top left" ? position.top_left : position.top_right
+    var table tb = table.new(pos, 7, array.size(defs) + 3, bgcolor = color.new(#131722, 15), border_width = 1, border_color = color.new(color.gray, 60))
+    hb = color.new(#2A2E39, 0)
+    table.cell(tb, 0, 0, " ",              text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 1, 0, "Patterns",       text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 2, 0, "Trades",         text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 3, 0, "T1 Success",     text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 4, 0, "T2 Success",     text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 5, 0, "Avg Return %",   text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 6, 0, "Total Return %", text_color = color.white, bgcolor = hb, text_size = size.small)
+
+    gFound = 0
+    gClosed = 0
     gT1 = 0
     gT2 = 0
     gRet = 0.0
-    gZone = 0
     for i = 0 to array.size(defs) - 1
-        pdRow = array.get(defs, i)
-        trades = 0
-        done = 0
-        t1 = 0
-        t2 = 0
-        ret = 0.0
+        pd = array.get(defs, i)
+        closed = 0
+        n1 = 0
+        n2 = 0
+        rsum = 0.0
         if array.size(sigs) > 0
             for j = 0 to array.size(sigs) - 1
                 s = array.get(sigs, j)
-                if s.patIdx == i
-                    trades += 1
-                    // status 0 (in progress) and 4 (timed out) have no outcome:
-                    // excluded from rates and returns, as the legend states.
-                    if s.status == 1 or s.status == 2 or s.status == 3
-                        done += 1
-                        ret += sigReturnPct(s)
-                        if s.tp1Hit
-                            t1 += 1
-                        if s.status == 1
-                            t2 += 1
-        zone = array.get(cntZone, i)
-        gZone += zone
-        gTrades += trades
-        gDone += done
-        gT1 += t1
-        gT2 += t2
-        gRet += ret
-        t1s = done > 0 ? str.tostring(float(t1) / done * 100, "#.#") + "%" : "—"
-        t2s = done > 0 ? str.tostring(float(t2) / done * 100, "#.#") + "%" : "—"
-        avgs = done > 0 ? str.tostring(ret / done, "#.##") + "%" : "—"
-        tots = done > 0 ? str.tostring(ret, "#.##") + "%" : "—"
-        retCol = ret > 0 ? color.new(#26A69A, 0) : ret < 0 ? color.new(#EF5350, 0) : color.new(color.gray, 0)
-        table.cell(t, 0, i + 1, pdRow.name, text_color = pdRow.col, text_size = size.small)
-        table.cell(t, 1, i + 1, str.tostring(zone),   text_color = color.new(color.gray, 0), text_size = size.small)
-        table.cell(t, 2, i + 1, str.tostring(trades), text_color = color.white, text_size = size.small)
-        table.cell(t, 3, i + 1, t1s,  text_color = color.white, text_size = size.small)
-        table.cell(t, 4, i + 1, t2s,  text_color = color.white, text_size = size.small)
-        table.cell(t, 5, i + 1, avgs, text_color = retCol, text_size = size.small)
-        table.cell(t, 6, i + 1, tots, text_color = retCol, text_size = size.small)
+                if s.patIdx == i and (s.status == 1 or s.status == 2 or s.status == 3)
+                    closed += 1
+                    rsum += retPct(s)
+                    if s.t1Hit
+                        n1 += 1
+                    if s.status == 1
+                        n2 += 1
+        found = array.get(cntFound, i)
+        gFound += found
+        gClosed += closed
+        gT1 += n1
+        gT2 += n2
+        gRet += rsum
+        rc = rsum > 0 ? #26A69A : rsum < 0 ? #EF5350 : color.gray
+        table.cell(tb, 0, i + 1, "  " + pd.sym + "  ", text_color = color.white, text_size = size.small)
+        table.cell(tb, 1, i + 1, str.tostring(found),  text_color = color.white, text_size = size.small)
+        table.cell(tb, 2, i + 1, str.tostring(closed), text_color = color.white, text_size = size.small)
+        table.cell(tb, 3, i + 1, closed > 0 ? str.tostring(float(n1) / closed * 100, "#.##") + "%" : "NA", text_color = color.white, text_size = size.small)
+        table.cell(tb, 4, i + 1, closed > 0 ? str.tostring(float(n2) / closed * 100, "#.##") + "%" : "NA", text_color = color.white, text_size = size.small)
+        table.cell(tb, 5, i + 1, closed > 0 ? str.tostring(rsum / closed, "#.##") + "%" : "NA", text_color = rc, text_size = size.small)
+        table.cell(tb, 6, i + 1, closed > 0 ? str.tostring(rsum, "#.##") + "%" : "NA",          text_color = rc, text_size = size.small)
 
     lr = array.size(defs) + 1
-    gT1s = gDone > 0 ? str.tostring(float(gT1) / gDone * 100, "#.#") + "%" : "—"
-    gT2s = gDone > 0 ? str.tostring(float(gT2) / gDone * 100, "#.#") + "%" : "—"
-    gAvg = gDone > 0 ? str.tostring(gRet / gDone, "#.##") + "%" : "—"
-    gTot = gDone > 0 ? str.tostring(gRet, "#.##") + "%" : "—"
-    gCol = gRet > 0 ? color.new(#26A69A, 0) : gRet < 0 ? color.new(#EF5350, 0) : color.new(color.gray, 0)
-    table.cell(t, 0, lr, "Total",                text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 1, lr, str.tostring(gZone),    text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 2, lr, str.tostring(gTrades),  text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 3, lr, gT1s, text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 4, lr, gT2s, text_color = color.white, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 5, lr, gAvg, text_color = gCol, bgcolor = hdr, text_size = size.small)
-    table.cell(t, 6, lr, gTot, text_color = gCol, bgcolor = hdr, text_size = size.small)
+    gc = gRet > 0 ? #26A69A : gRet < 0 ? #EF5350 : color.gray
+    table.cell(tb, 0, lr, "Total",                text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 1, lr, str.tostring(gFound),   text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 2, lr, str.tostring(gClosed),  text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 3, lr, gClosed > 0 ? str.tostring(float(gT1) / gClosed * 100, "#.##") + "%" : "NA", text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 4, lr, gClosed > 0 ? str.tostring(float(gT2) / gClosed * 100, "#.##") + "%" : "NA", text_color = color.white, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 5, lr, gClosed > 0 ? str.tostring(gRet / gClosed, "#.##") + "%" : "NA", text_color = gc, bgcolor = hb, text_size = size.small)
+    table.cell(tb, 6, lr, gClosed > 0 ? str.tostring(gRet, "#.##") + "%" : "NA",          text_color = gc, bgcolor = hb, text_size = size.small)
+
+    kr = array.size(defs) + 2
+    table.cell(tb, 0, kr, "✅✅ = T1+T2  |  ✅ = T1 only  |  ❌ = Stopped  |  🕝 = Timed out*  |  ⏳ = In progress*\n*Not included in Success Rate / Return % statistics", text_color = color.new(color.white, 25), text_size = size.tiny)
+    table.merge_cells(tb, 0, kr, 6, kr)
