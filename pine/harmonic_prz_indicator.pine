@@ -82,6 +82,12 @@ gT = "Timing"
 confirmBars = input.int(2, "Bars to confirm point D", minval = 1, maxval = 10, group = gT, tooltip = "Bars that must close after the D pivot before the pattern is treated as valid and an entry is recorded. Entry price is the close of that confirming bar.")
 tLimitMult  = input.float(3.0, "Pattern time limit (× pattern length)", minval = 0.5, step = 0.5, group = gT, tooltip = "How long a pattern has to reach its targets, measured in multiples of its own X-to-D length. Patterns that expire are marked timed out and excluded from the statistics.")
 
+gF = "Forward-looking (setups still forming)"
+showPot     = input.bool(true, "Project patterns whose D has not formed yet", group = gF, tooltip = "Once X-A-B-C are in place the PRZ where D is expected can be computed before price gets there. Without this the script is purely retrospective — it only reports patterns that already completed, which is useless for trading the current bar.")
+potExpire   = input.float(1.5, "Give D this long to arrive (× XABC length)", minval = 0.25, step = 0.25, group = gF, tooltip = "If price has not reached the projected PRZ within this multiple of the X-to-C length, the setup is abandoned and its drawing removed.")
+showLive    = input.bool(true, "Show live status panel", group = gF, tooltip = "Lists what is actionable right now: setups awaiting D, setups whose PRZ price has already reached, and open trades with their current R.")
+livePos     = input.string("Top right", "Live panel", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = gF)
+
 gV = "Display"
 showPoly    = input.bool(true, "Fill pattern shape", inline = "v1", group = gV)
 showLabels  = input.bool(true, "Labels", inline = "v1", group = gV)
@@ -127,12 +133,34 @@ type Sig
     float  score
     label  lbl
 
+// A pattern whose X-A-B-C have formed but whose D has not. This is the
+// forward-looking half: it projects the PRZ where D is expected and watches
+// for price to arrive there. Without this the script is purely retrospective —
+// it can only report patterns that already completed.
+type Potential
+    int    patIdx
+    bool   isBull
+    int    ci
+    float  cp
+    float  aPrice
+    float  xPrice
+    float  przLo
+    float  przHi
+    float  score
+    int    expireBar
+    bool   reached    // price has traded into the projected PRZ
+    box    zone
+    label  lbl
+    line   proj
+
 // ------------------------------------------------------------ Persisted ---
 var ZZ[]     zzs  = array.new<ZZ>()
 var PatDef[] defs = array.new<PatDef>()
 var Sig[]    sigs = array.new<Sig>()
 var string[] seen = array.new<string>()   // dedup key per (type, dir, X, A, B, C, D)
 var int[]    cntFound = array.new<int>()
+var Potential[] pots    = array.new<Potential>()
+var string[]    seenPot = array.new<string>()
 
 // -------------------------------------------------------------- Helpers ---
 // Relative error against a theoretical ratio window, the reference's convention.
@@ -339,12 +367,113 @@ checkScale(ZZ z, bool isNew) =>
                                                 tt = pd.name + (isBull ? "  ▲ LONG" : "  ▼ SHORT") + "\nScore " + str.tostring(score, "#.#") + "\n\nAB/XA " + str.tostring(bRat, "0.000") + "  (" + str.tostring(pd.bLo, "0.000") + (pd.bLo == pd.bHi ? "" : "-" + str.tostring(pd.bHi, "0.000")) + ")\n" + (pd.cOnXA ? "XC/XA " : "BC/AB ") + str.tostring(pd.cOnXA ? cRatXA : cRat, "0.000") + "  (" + str.tostring(pd.cLo, "0.000") + "-" + str.tostring(pd.cHi, "0.000") + ")\n\nEntry " + str.tostring(entry, format.mintick) + "\nStop  " + str.tostring(stop, format.mintick) + "\nT1    " + str.tostring(s.t1, format.mintick) + "\nT2    " + str.tostring(s.t2, format.mintick) + "\nR:R   " + str.tostring(math.abs(s.t2 - entry) / math.abs(entry - stop), "#.##")
                                                 s.lbl := label.new(D.idx, D.price, pd.sym + " " + str.tostring(score, "#") + " ⏳", xloc = xloc.bar_index, style = isBull ? label.style_label_up : label.style_label_down, color = color.new(col, 20), textcolor = color.white, size = size.small, tooltip = tt)
 
+// ------------------------------------------ Potential patterns (D pending) ---
+// The forward-looking half. X-A-B-C are in place; D is not. Its PRZ can still
+// be computed, so the zone is projected ahead and watched. This is what makes
+// the script usable on the current bar rather than only in hindsight.
+scanPotential(ZZ z, bool isNew) =>
+    if showPot and isNew and array.size(z.pts) >= 4 and array.size(defs) > 0
+        n = array.size(z.pts)
+        X = array.get(z.pts, n - 4)
+        A = array.get(z.pts, n - 3)
+        B = array.get(z.pts, n - 2)
+        C = array.get(z.pts, n - 1)
+
+        xa = A.price - X.price
+        ab = A.price - B.price
+        bc = C.price - B.price
+        xc = C.price - X.price
+
+        if xa != 0 and ab != 0 and bc != 0
+            isBull = xa > 0
+            if (isBull and useBull) or (not isBull and useBear)
+                bRat = ab / xa
+                cRat = bc / ab
+                cRatXA = xc / xa
+
+                for i = 0 to array.size(defs) - 1
+                    pd = array.get(defs, i)
+                    cCheck = pd.cOnXA ? okRatio(cRatXA, pd.cLo, pd.cHi, pctErr) : okRatio(cRat, pd.cLo, pd.cHi, pctErr)
+                    if bRat > 0 and okRatio(bRat, pd.bLo, pd.bHi, pctErr) and cCheck
+                        key = "P" + pd.sym + (isBull ? "L" : "S") + str.tostring(C.idx)
+                        if not array.includes(seenPot, key)
+                            array.push(seenPot, key)
+                            if array.size(seenPot) > 400
+                                array.shift(seenPot)
+
+                            dRefFrom = pd.dOnXC ? C.price : A.price
+                            dLoPx = dRefFrom + pd.dLo * (X.price - dRefFrom)
+                            dHiPx = dRefFrom + pd.dHi * (X.price - dRefFrom)
+                            dLegLen = math.abs(X.price - dRefFrom)
+                            tolPx = dLegLen * (pctErr / 100)
+                            zLo = math.min(dLoPx, dHiPx) - tolPx
+                            zHi = math.max(dLoPx, dHiPx) + tolPx
+
+                            // Score without the D term, which does not exist yet.
+                            accB = fitScore(bRat, pd.bLo, pd.bHi, pctErr)
+                            accC = fitScore(pd.cOnXA ? cRatXA : cRat, pd.cLo, pd.cHi, pctErr)
+                            przTight = dLegLen > 0 ? math.max(0.0, 1.0 - (zHi - zLo) / dLegLen) : 0.0
+                            sc = ((accB + accC) / 2 * 4 + przTight * 2) / 6 * 100
+
+                            // A zone already behind price is not a setup.
+                            stillAhead = isBull ? low > zLo : high < zHi
+                            if sc >= minScore and stillAhead
+                                col = isBull ? cBull : cBear
+                                exp = bar_index + int(math.max(10, C.idx - X.idx) * potExpire)
+                                bx = box.new(C.idx, zHi, bar_index + 15, zLo, xloc = xloc.bar_index, bgcolor = color.new(col, 82), border_color = color.new(col, 40), border_width = 1, border_style = line.style_dashed)
+                                pj = line.new(C.idx, C.price, bar_index + 15, (zLo + zHi) / 2, xloc = xloc.bar_index, color = color.new(col, 45), style = line.style_dashed, width = 1)
+                                lb = label.new(bar_index + 15, (zLo + zHi) / 2, "◇ " + pd.sym + " " + str.tostring(sc, "#"), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(col, 45), textcolor = color.white, size = size.tiny, tooltip = "POTENTIAL " + pd.name + (isBull ? "  ▲ LONG" : "  ▼ SHORT") + "\nD has not formed yet.\n\nScore so far " + str.tostring(sc, "#.#") + " (excludes D confluence)\nPRZ " + str.tostring(zLo, format.mintick) + " – " + str.tostring(zHi, format.mintick) + "\n\nInvalid if price passes " + str.tostring(A.price, format.mintick) + " (point A)")
+                                array.push(pots, Potential.new(i, isBull, C.idx, C.price, A.price, X.price, zLo, zHi, sc, exp, false, bx, lb, pj))
+                                // Bounded explicitly. Past max_boxes_count Pine silently
+                                // drops the oldest drawing, which would leave this array
+                                // holding stale handles that later set_* calls touch.
+                                if array.size(pots) > 30
+                                    old = array.shift(pots)
+                                    box.delete(old.zone)
+                                    label.delete(old.lbl)
+                                    line.delete(old.proj)
+
 if array.size(zzs) > 4
     checkScale(array.get(zzs, 0), newAt0)
     checkScale(array.get(zzs, 1), newAt1)
     checkScale(array.get(zzs, 2), newAt2)
     checkScale(array.get(zzs, 3), newAt3)
     checkScale(array.get(zzs, 4), newAt4)
+    scanPotential(array.get(zzs, 0), newAt0)
+    scanPotential(array.get(zzs, 1), newAt1)
+    scanPotential(array.get(zzs, 2), newAt2)
+    scanPotential(array.get(zzs, 3), newAt3)
+    scanPotential(array.get(zzs, 4), newAt4)
+
+// ---------------------------------------------- Keep potentials alive/current ---
+// Each bar: extend the projection to the right edge, flag the moment price
+// first reaches the PRZ, and drop the setup once point A is breached (the
+// structure is gone) or the clock runs out.
+if array.size(pots) > 0
+    kept = array.new<Potential>()
+    for q = 0 to array.size(pots) - 1
+        p = array.get(pots, q)
+        broke = p.isBull ? high > p.aPrice : low < p.aPrice
+        expired = bar_index >= p.expireBar
+        if broke or expired
+            box.delete(p.zone)
+            label.delete(p.lbl)
+            line.delete(p.proj)
+        else
+            inZone = low <= p.przHi and high >= p.przLo
+            if inZone and not p.reached
+                p.reached := true
+                pdp = array.get(defs, p.patIdx)
+                label.set_text(p.lbl, "◆ " + pdp.sym + " PRZ")
+                label.set_color(p.lbl, color.new(p.isBull ? cBull : cBear, 10))
+                box.set_bgcolor(p.zone, color.new(p.isBull ? cBull : cBear, 60))
+                box.set_border_style(p.zone, line.style_solid)
+                alert(pdp.name + (p.isBull ? " ▲ LONG" : " ▼ SHORT") + " PRZ reached on " + syminfo.ticker + " — awaiting D confirmation", alert.freq_once_per_bar_close)
+            box.set_right(p.zone, bar_index + 15)
+            line.set_x2(p.proj, bar_index + 15)
+            label.set_x(p.lbl, bar_index + 15)
+            array.push(kept, p)
+    pots := kept
 
 // ------------------------------------------------------- Outcome tracking ---
 // Every pattern runs to its own outcome — no position limit, unlike the
@@ -438,3 +567,69 @@ if showTable and barstate.islast and array.size(defs) > 0
     kr = array.size(defs) + 2
     table.cell(tb, 0, kr, "✅✅ = T1+T2  |  ✅ = T1 only  |  ❌ = Stopped  |  🕝 = Timed out*  |  ⏳ = In progress*\n*Not included in Success Rate / Return % statistics", text_color = color.new(color.white, 25), text_size = size.tiny)
     table.merge_cells(tb, 0, kr, 6, kr)
+
+// ------------------------------------------------------------ Live panel ---
+// What is actionable on the CURRENT bar, as opposed to the statistics table
+// which is entirely historical. Rows are ordered by urgency: setups whose PRZ
+// price has already reached come first, then open trades, then setups still
+// waiting for price to arrive.
+if showLive and barstate.islast
+    lp = livePos == "Top right" ? position.top_right : livePos == "Top left" ? position.top_left : livePos == "Bottom right" ? position.bottom_right : position.bottom_left
+    var table lt = table.new(lp, 5, 10, bgcolor = color.new(#131722, 12), border_width = 1, border_color = color.new(color.gray, 60))
+    lh = color.new(#2A2E39, 0)
+    table.cell(lt, 0, 0, "LIVE",    text_color = color.white, bgcolor = lh, text_size = size.small)
+    table.cell(lt, 1, 0, "Dir",     text_color = color.white, bgcolor = lh, text_size = size.small)
+    table.cell(lt, 2, 0, "Zone / Entry", text_color = color.white, bgcolor = lh, text_size = size.small)
+    table.cell(lt, 3, 0, "Stop",    text_color = color.white, bgcolor = lh, text_size = size.small)
+    table.cell(lt, 4, 0, "Status",  text_color = color.white, bgcolor = lh, text_size = size.small)
+
+    int row = 1
+    // 1. PRZ reached — price is in the zone now, D not yet confirmed
+    if array.size(pots) > 0
+        for q = 0 to array.size(pots) - 1
+            p = array.get(pots, q)
+            if p.reached and row <= 8
+                pdp = array.get(defs, p.patIdx)
+                table.cell(lt, 0, row, pdp.sym + " " + str.tostring(p.score, "#"), text_color = color.white, text_size = size.tiny)
+                table.cell(lt, 1, row, p.isBull ? "▲" : "▼", text_color = p.isBull ? cBull : cBear, text_size = size.tiny)
+                table.cell(lt, 2, row, str.tostring(p.przLo, format.mintick) + "–" + str.tostring(p.przHi, format.mintick), text_color = color.white, text_size = size.tiny)
+                table.cell(lt, 3, row, "—", text_color = color.new(color.gray, 20), text_size = size.tiny)
+                table.cell(lt, 4, row, "IN PRZ", text_color = #FFD54F, text_size = size.tiny)
+                row += 1
+    // 2. Open trades, with current R
+    if array.size(sigs) > 0
+        for j = 0 to array.size(sigs) - 1
+            s = array.get(sigs, j)
+            if s.status == 0 and row <= 8
+                pds = array.get(defs, s.patIdx)
+                rNow = math.abs(s.entry - s.stop) > 0 ? (s.isBull ? close - s.entry : s.entry - close) / math.abs(s.entry - s.stop) : 0.0
+                table.cell(lt, 0, row, pds.sym + " " + str.tostring(s.score, "#"), text_color = color.white, text_size = size.tiny)
+                table.cell(lt, 1, row, s.isBull ? "▲" : "▼", text_color = s.isBull ? cBull : cBear, text_size = size.tiny)
+                table.cell(lt, 2, row, str.tostring(s.entry, format.mintick), text_color = color.white, text_size = size.tiny)
+                table.cell(lt, 3, row, str.tostring(s.stop, format.mintick), text_color = color.new(#EF5350, 20), text_size = size.tiny)
+                table.cell(lt, 4, row, (s.t1Hit ? "T1 ✓  " : "OPEN  ") + str.tostring(rNow, "+0.0;-0.0") + "R", text_color = rNow >= 0 ? #26A69A : #EF5350, text_size = size.tiny)
+                row += 1
+    // 3. Setups still waiting for price to reach the zone
+    if array.size(pots) > 0
+        for q = 0 to array.size(pots) - 1
+            p = array.get(pots, q)
+            if not p.reached and row <= 8
+                pdp = array.get(defs, p.patIdx)
+                mid = (p.przLo + p.przHi) / 2
+                away = close != 0 ? math.abs(mid - close) / close * 100 : 0.0
+                table.cell(lt, 0, row, pdp.sym + " " + str.tostring(p.score, "#"), text_color = color.new(color.white, 30), text_size = size.tiny)
+                table.cell(lt, 1, row, p.isBull ? "▲" : "▼", text_color = color.new(p.isBull ? cBull : cBear, 30), text_size = size.tiny)
+                table.cell(lt, 2, row, str.tostring(p.przLo, format.mintick) + "–" + str.tostring(p.przHi, format.mintick), text_color = color.new(color.white, 30), text_size = size.tiny)
+                table.cell(lt, 3, row, "—", text_color = color.new(color.gray, 40), text_size = size.tiny)
+                table.cell(lt, 4, row, str.tostring(away, "#.#") + "% away", text_color = color.new(color.gray, 15), text_size = size.tiny)
+                row += 1
+
+    if row == 1
+        table.cell(lt, 0, 1, "No setups forming", text_color = color.new(color.gray, 15), text_size = size.tiny)
+        table.merge_cells(lt, 0, 1, 4, 1)
+        row := 2
+    // Blank any rows left over from a previous bar's longer list
+    if row <= 9
+        for r2 = row to 9
+            for c2 = 0 to 4
+                table.cell(lt, c2, r2, "", bgcolor = color.new(color.black, 100))
