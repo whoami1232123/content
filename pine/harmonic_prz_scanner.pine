@@ -98,6 +98,7 @@ rrMin         = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5
 stopBufA      = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio (added to stopR)", minval = 0.0, step = 0.01, group = grpRisk)
 requireConfirm = input.bool(true, "Require engulfing confirmation inside the PRZ before entry (§7.4)", group = grpRisk)
 riskPct       = input.float(1.0, "Risk % of equity per trade (§7.5)", minval = 0.1, step = 0.1, group = grpRisk)
+useWickForZone = input.bool(false, "Test zone entry on wick, not close (§6.4)", group = grpRisk, tooltip = "PRD §6.4 default is close-based: a bar only counts as touching the PRZ if it CLOSES inside it, matching this strategy's process_orders_on_close=true fill price. Wick-based is more sensitive (catches an intrabar spike into the zone) but the drawn D point and computed entry/stop/TP will then disagree with where the trade actually filled — off by default for that reason.")
 
 // ----------------------------------------------------------------- Types ---
 type Pivot
@@ -192,7 +193,11 @@ if array.size(zz) >= 4 and array.size(defs) > 0
 
     if xaLeg != 0 and abLeg != 0 and bcLeg != 0
         isBullish  = xaLeg > 0          // A>X: XA rises -> D projects down -> long at D (§2.3)
-        dTestPrice = isBullish ? low : high
+        // §6.4 — close-based by default, and critically must match the price the
+        // strategy actually fills at (process_orders_on_close=true fills at `close`).
+        // Using the wick here would draw a D point and compute a stop/TP/R:R for a
+        // price the trade never actually entered at.
+        dTestPrice = useWickForZone ? (isBullish ? low : high) : close
 
         // Only B and C are gated here (§2.2): both are fixed once C confirms and don't
         // depend on the still-forming D. BC-projection, AB=CD and the D-of-XA ratio are
