@@ -503,6 +503,37 @@ TP2 = P(D, A, 0.618)
 entirely, producing a target further away than the structure that generated it. The AD leg is the
 canonical reference and is well-behaved across all four patterns.
 
+#### 7.3.1 The AD-leg targets conflict with the §7.6 R:R gate
+
+Phase 1 implementation surfaced a defect in this PRD's own numbers. Combining §7.3's AD-leg
+targets with §3.2's stop ratios fixes each pattern's maximum achievable R:R — and for two
+patterns that maximum is **below the §7.6 floor of 2.0**, so they can never produce a trade at all.
+Normalised to `|XA| = 1`, with the default 0.05 stop buffer:
+
+| Pattern | Entry (D) | Stop | Risk | R:R to TP1 | R:R to TP2 | Clears 2.0? |
+|---|---|---|---|---|---|---|
+| Gartley | 0.786 XA | 1.100 XA | 0.314 | 0.96 | **1.55** | **No — never fires** |
+| Bat | 0.886 XA | 1.100 XA | 0.214 | 1.58 | 2.56 | Yes |
+| Butterfly (near edge, 1.270) | 1.270 XA | 1.800 XA | 0.530 | 0.92 | **1.48** | **No** |
+| Butterfly (far edge, 1.618) | 1.618 XA | 1.800 XA | 0.182 | 3.40 | 5.49 | Yes |
+| Crab | 1.618 XA | 1.952 XA | 0.334 | 1.85 | 2.99 | Yes |
+
+Two consequences, both observed on real charts (BLK: 2 Gartley zones → 0 trades; BABA: 3 → 0):
+
+1. **The Gartley is unreachable**, and the Butterfly only fires from the far edge of its own PRZ.
+2. Even for the patterns that clear the gate, TP2 sits **0.55–1.00 XA-lengths** from entry —
+   price must retrace most of the A→D move — so the stop is hit first in the large majority of
+   cases. TP1 is scarcely closer.
+
+**Resolution.** The engine offers a second target basis, **R-multiple** (TP1 = 1R, TP2 = 2R), and
+Phase 1 defaults to it. Every pattern clears the R:R gate by construction, and TP2 lands 36–78%
+closer for Bat, Crab and far-edge Butterfly. The AD-leg basis remains selectable for
+harmonic-canon fidelity, with the caveat above documented in the UI.
+
+This is a genuine tension in the source method, not merely an implementation artefact: the
+canonical targets and the canonical stops were not designed against a fixed minimum-R:R filter.
+Anyone applying all three together should expect the Gartley to disappear.
+
 The **Shark is the exception** and uses its own rule: **TP = 0.500 retracement of BC** (§3.3).
 
 ### 7.4 The confirmation gate

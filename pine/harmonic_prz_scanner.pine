@@ -113,11 +113,13 @@ grpRisk = "Tolerance & Risk (§2.4, §7)"
 tolPct         = input.float(2.0, "Ratio tolerance (%, ratio-space — see header)", minval = 0.1, step = 0.1, group = grpRisk)
 maxSpreadPct   = input.float(15.0, "Max PRZ contributor spread, % of XA leg (§6.3)", minval = 1.0, step = 1.0, group = grpRisk, tooltip = "The PRZ is where the XA-ratio, BC-projection and AB=CD projections CONVERGE. If their midpoints disagree by more than this fraction of the XA leg, the ratios do not agree on a zone (PRZ_DISPERSED) and the candidate never arms. Raise to accept looser confluence and get more setups; lower for only tight, high-quality zones.")
 rrMin          = input.float(2.0, "Minimum R:R to TP2 (§7.6 gate)", minval = 0.5, step = 0.1, group = grpRisk)
+targetMode     = input.string("R-multiple (1R / 2R)", "Take-profit basis", options = ["R-multiple (1R / 2R)", "AD-leg 38.2% / 61.8% (§7.3)"], group = grpRisk, tooltip = "AD-leg is the harmonic-canon rule from PRD §7.3, but with §3.2's stop ratios it makes the GARTLEY mathematically unable to pass a 2.0 R:R gate (its best possible R:R to TP2 is 1.55) and a near-edge BUTTERFLY likewise (1.48) — those two patterns can never fire, and the survivors carry TP2 targets 0.55-1.00 XA-lengths away that price rarely reaches before the stop. R-multiple sets TP1/TP2 at 1R/2R from entry: every pattern clears the gate by construction, and targets land 36-78% closer for Bat, Crab and far-Butterfly.")
 stopBufA       = input.float(0.05, "Extra stop buffer, in units of the §3.2 D-ratio", minval = 0.0, step = 0.01, group = grpRisk)
 requireConfirm = input.bool(true, "Require a confirmation candle inside the PRZ (§7.4)", group = grpRisk, tooltip = "PRD §7.4: never rest a blind limit order at D. Turning this OFF enters on first PRZ touch — more trades, materially worse strategy, and contrary to the spec.")
 confirmBars    = input.int(5, "Bars the PRZ stays armed awaiting confirmation", minval = 1, maxval = 50, group = grpRisk, tooltip = "Once price reaches the PRZ the zone ARMS for this many bars, during which a confirmation candle triggers entry. 1 reproduces the old (buggy) same-bar-only behavior. This is the single biggest driver of how many trades fire.")
 useEngulfOnly  = input.bool(false, "Confirmation must be a full engulfing candle", group = grpRisk, tooltip = "OFF (default): a full engulfing OR a rejection/pin candle closing in the trade direction counts. ON: engulfing only — stricter, far fewer trades.")
 riskPct        = input.float(1.0, "Risk % of equity per trade (§7.5)", minval = 0.1, step = 0.1, group = grpRisk)
+maxHoldBars    = input.int(120, "Table tracker: bars before an open trade expires", minval = 10, group = grpRisk, tooltip = "Only affects the on-chart table, never the strategy. The tracker holds one trade at a time (matching pyramiding=0); without an expiry a trade that never reaches its stop or TP2 would occupy that slot forever and every later trade would record no outcome.")
 useWickForZone = input.bool(true, "Zone touch counts on wick (not just close)", group = grpRisk, tooltip = "ON (default): the PRZ is considered reached if the bar's wick trades into it — which is what actually happens at a reversal zone. The ENTRY price is still the confirmation bar's close, so drawn levels always match the real fill. OFF: the bar must CLOSE inside the zone (PRD §6.4 strict reading) — more conservative, fewer arms.")
 
 // ----------------------------------------------------------------- Types ---
@@ -181,6 +183,7 @@ var float tradeTp1        = na
 var float tradeTp2        = na
 var bool  tradeIsBullish  = false
 var bool  tp1AlreadyHit   = false
+var int   tradeBarsOpen   = 0
 var int[] cntTrades = array.new<int>()
 var int[] cntTP1    = array.new<int>()
 var int[] cntTP2    = array.new<int>()
@@ -396,9 +399,15 @@ if array.size(armed) > 0
                 if confirmed and array.get(lastSigC, i) != az.ci
                     entryPrice = close                       // matches process_orders_on_close
                     adLeg = az.aPrice - entryPrice
-                    tp1 = entryPrice + 0.382 * adLeg         // §7.3 — AD leg, not CD
-                    tp2 = entryPrice + 0.618 * adLeg
                     risk = math.abs(entryPrice - az.stopPrice)
+                    dirSign = az.isBull ? 1.0 : -1.0
+                    // AD-leg is PRD §7.3's canon rule; R-multiple exists because
+                    // §7.3 combined with §3.2's stop ratios makes Gartley (max R:R
+                    // 1.55) and near-edge Butterfly (1.48) unable to clear a 2.0
+                    // gate at all. See the target-basis tooltip and PRD §7.3.
+                    useR = targetMode == "R-multiple (1R / 2R)"
+                    tp1 = useR ? entryPrice + dirSign * 1.0 * risk : entryPrice + 0.382 * adLeg
+                    tp2 = useR ? entryPrice + dirSign * 2.0 * risk : entryPrice + 0.618 * adLeg
                     rr2 = risk > 0 ? math.abs(tp2 - entryPrice) / risk : 0.0
 
                     // §7.1's stop-outside-PRZ invariant is checked at ARM time
@@ -417,6 +426,7 @@ if array.size(armed) > 0
                             tradeTp2        := tp2
                             tradeIsBullish  := az.isBull
                             tp1AlreadyHit   := false
+                            tradeBarsOpen   := 0
 
                         qty = (strategy.equity * riskPct / 100) / risk
                         entryId = pd.name + "_" + str.tostring(az.ci)
@@ -443,6 +453,7 @@ if array.size(armed) > 0
 // first — if a bar spans both, it counts as a loss (pessimistic same-bar
 // assumption, deliberately not flattering).
 if tradeOpen
+    tradeBarsOpen := tradeBarsOpen + 1
     hitStop = tradeIsBullish ? low <= tradeStop : high >= tradeStop
     if hitStop
         array.set(cntSL, tradePatternIdx, array.get(cntSL, tradePatternIdx) + 1)
@@ -455,6 +466,13 @@ if tradeOpen
         hitTp2 = tradeIsBullish ? high >= tradeTp2 : low <= tradeTp2
         if hitTp2
             array.set(cntTP2, tradePatternIdx, array.get(cntTP2, tradePatternIdx) + 1)
+            tradeOpen := false
+        else if tradeBarsOpen >= maxHoldBars
+            // Expiry. Without this a single trade that never reaches its stop
+            // or TP2 keeps the one tracking slot occupied for the rest of the
+            // chart, so every later trade silently records no outcome at all —
+            // which reads as "Trades > 0 but TP and SL both 0". Counted via
+            // the table's `untracked` figure rather than its own tally.
             tradeOpen := false
 
 // ------------------------------------------------------------ On-chart report ---
@@ -508,7 +526,11 @@ if showPerfTable and barstate.islast and array.size(defs) > 0
     table.cell(perfTable, 3, lastRow, str.tostring(totTP1),    text_color = color.white)
     table.cell(perfTable, 4, lastRow, str.tostring(totTP2),    text_color = color.white)
     table.cell(perfTable, 5, lastRow, str.tostring(totSL),     text_color = color.white)
-    table.cell(perfTable, 6, lastRow, totWr,                   text_color = color.white)
+    // Trades that never reached stop or TP2 within maxHoldBars, plus any that
+    // fired while the single tracking slot was busy. Shown so the row
+    // reconciles: TP2 + SL + untracked should equal Trades.
+    untracked = totTrades - totTP2 - totSL
+    table.cell(perfTable, 6, lastRow, totWr + (untracked > 0 ? "  (" + str.tostring(untracked) + " untracked)" : ""), text_color = color.white)
 
 alertcondition(przActiveThisBar, title = "PRZ Active", message = "Price entered a harmonic PRZ zone on {{ticker}} {{interval}}")
 
