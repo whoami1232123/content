@@ -85,6 +85,7 @@ grpDet = "Detection (§5)"
 pivotDepth = input.int(5, "Pivot confirmation depth (bars each side)", minval = 2, group = grpDet, tooltip = "A pivot only becomes visible pivotDepth bars after it forms — this is what makes detection non-repainting (§5.2 D1/D2).")
 maxPivots  = input.int(60, "Max stored zig-zag points", minval = 12, group = grpDet)
 showCandidates = input.bool(true, "Show diagnostic dot on any partial B/C match", group = grpDet, tooltip = "A full trade requires B, C, the PRZ, an engulfing confirmation AND the R:R gate to all pass on one structure — genuinely rare. This dot fires on the much weaker condition of just B and C matching some pattern's window, so you can see the scanner is alive between full setups.")
+showPerfTable = input.bool(true, "Show on-chart performance table", group = grpDet, tooltip = "Per-pattern trade/TP1/TP2/SL counts, updated live on the chart — no need to open the Strategy Tester tab to see whether the script has done anything. A simplified parallel tracker (§7.2 realism caveats apply); the Strategy Tester remains the authoritative number for §11.5 validation.")
 
 grpPat = "Patterns (§3.2)"
 useGartley   = input.bool(true, "Gartley",   group = grpPat)
@@ -129,6 +130,26 @@ var Pivot[]      zz       = array.new<Pivot>()
 var PatternDef[] defs     = array.new<PatternDef>()
 var int[]        lastSigC = array.new<int>()
 
+// Lightweight parallel outcome tracker for the on-chart performance table
+// below (§ "On-chart report"). Purely observational — it reads the same
+// stop/tp1/tp2 a signal computed and watches subsequent bars' high/low for
+// a touch, entirely separate from strategy.entry/exit. It does NOT model
+// commission/slippage or same-bar stop-vs-target ambiguity as precisely as
+// the Strategy Tester does (§7.2, §11.5) — for a rigorous number, use the
+// Strategy Tester; this table exists so a signal's outcome is visible
+// without leaving the chart.
+var bool  tradeOpen        = false
+var int   tradePatternIdx  = -1
+var float tradeStop        = na
+var float tradeTp1         = na
+var float tradeTp2         = na
+var bool  tradeIsBullish   = false
+var bool  tp1AlreadyHit    = false
+var int[] cntTrades = array.new<int>()
+var int[] cntTP1    = array.new<int>()
+var int[] cntTP2    = array.new<int>()
+var int[] cntSL     = array.new<int>()
+
 // -------------------------------------------------------------- Helpers ---
 inWindow(float val, float lo, float hi, float tol) =>
     val >= lo - tol and val <= hi + tol
@@ -163,6 +184,10 @@ if barstate.isfirst
         array.push(defs, PatternDef.new("Crab",      0.382, 0.618, 0.382, 0.886, 2.240, 3.618, 1.618, 1.618, 1.618, 1.618, 1.618, 1.902, color.new(color.red, 0)))
     for i = 0 to array.size(defs) - 1
         array.push(lastSigC, -1)
+        array.push(cntTrades, 0)
+        array.push(cntTP1, 0)
+        array.push(cntTP2, 0)
+        array.push(cntSL, 0)
 
 // ---------------------------------------------------------- Pivot feed  ---
 ph = ta.pivothigh(pivotDepth, pivotDepth)
@@ -256,6 +281,15 @@ if array.size(zz) >= 4 and array.size(defs) > 0
 
                         if risk > 0 and rr2 >= rrMin        // §7.6 — hard R:R gate
                             array.set(lastSigC, i, C.idx)
+                            array.set(cntTrades, i, array.get(cntTrades, i) + 1)
+                            if not tradeOpen        // report-table tracker; pyramiding=0 means Pine itself won't stack a second real position anyway
+                                tradeOpen := true
+                                tradePatternIdx := i
+                                tradeStop := stopPrice
+                                tradeTp1 := tp1
+                                tradeTp2 := tp2
+                                tradeIsBullish := isBullish
+                                tp1AlreadyHit := false
                             qty = (strategy.equity * riskPct / 100) / risk
                             entryId = pd.name + "_" + str.tostring(C.idx)
 
@@ -276,6 +310,68 @@ if array.size(zz) >= 4 and array.size(defs) > 0
                             label.new(bar_index, entryPrice, text = lbl, xloc = xloc.bar_index, style = isBullish ? label.style_label_up : label.style_label_down, color = pd.col, textcolor = color.white, size = size.small)
 
                             alert(pd.name + " " + dirTxt + " confirmed — entry " + str.tostring(entryPrice) + " stop " + str.tostring(stopPrice) + " TP2 " + str.tostring(tp2) + " R:R " + str.tostring(rr2, "#.##"), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------- Outcome tracking (table) ---
+// Unconditional, every bar: watches the currently open tracked signal (if any)
+// for a stop or target touch on subsequent bars' high/low. Stop is checked
+// first — if a bar's range spans both the stop and a target, this counts it
+// as a loss (pessimistic same-bar-ambiguity assumption).
+if tradeOpen
+    hitStop = tradeIsBullish ? low <= tradeStop : high >= tradeStop
+    if hitStop
+        array.set(cntSL, tradePatternIdx, array.get(cntSL, tradePatternIdx) + 1)
+        tradeOpen := false
+    else
+        hitTp1 = tradeIsBullish ? high >= tradeTp1 : low <= tradeTp1
+        if hitTp1 and not tp1AlreadyHit
+            tp1AlreadyHit := true
+            array.set(cntTP1, tradePatternIdx, array.get(cntTP1, tradePatternIdx) + 1)
+        hitTp2 = tradeIsBullish ? high >= tradeTp2 : low <= tradeTp2
+        if hitTp2
+            array.set(cntTP2, tradePatternIdx, array.get(cntTP2, tradePatternIdx) + 1)
+            tradeOpen := false
+
+// ------------------------------------------------------------ On-chart report ---
+if showPerfTable and barstate.islast
+    var table perfTable = table.new(position.top_right, 6, array.size(defs) + 2, bgcolor = color.new(color.gray, 15), border_width = 1, border_color = color.gray)
+    hdrBg = color.new(color.gray, 50)
+    table.cell(perfTable, 0, 0, "Pattern",    text_color = color.white, bgcolor = hdrBg)
+    table.cell(perfTable, 1, 0, "Trades",     text_color = color.white, bgcolor = hdrBg)
+    table.cell(perfTable, 2, 0, "TP1",        text_color = color.white, bgcolor = hdrBg)
+    table.cell(perfTable, 3, 0, "TP2",        text_color = color.white, bgcolor = hdrBg)
+    table.cell(perfTable, 4, 0, "SL",         text_color = color.white, bgcolor = hdrBg)
+    table.cell(perfTable, 5, 0, "Win% (TP2)", text_color = color.white, bgcolor = hdrBg)
+
+    totTrades = 0
+    totTP1 = 0
+    totTP2 = 0
+    totSL = 0
+    for i = 0 to array.size(defs) - 1
+        pdRow = array.get(defs, i)
+        t  = array.get(cntTrades, i)
+        p1 = array.get(cntTP1, i)
+        p2 = array.get(cntTP2, i)
+        sl = array.get(cntSL, i)
+        wr = t > 0 ? str.tostring(float(p2) / t * 100, "#.#") + "%" : "—"   // float() cast avoids int/int truncation before the *100
+        table.cell(perfTable, 0, i + 1, pdRow.name, text_color = pdRow.col)
+        table.cell(perfTable, 1, i + 1, str.tostring(t))
+        table.cell(perfTable, 2, i + 1, str.tostring(p1))
+        table.cell(perfTable, 3, i + 1, str.tostring(p2))
+        table.cell(perfTable, 4, i + 1, str.tostring(sl))
+        table.cell(perfTable, 5, i + 1, wr)
+        totTrades := totTrades + t
+        totTP1 := totTP1 + p1
+        totTP2 := totTP2 + p2
+        totSL := totSL + sl
+
+    lastRow = array.size(defs) + 1
+    totWr = totTrades > 0 ? str.tostring(float(totTP2) / totTrades * 100, "#.#") + "%" : "—"
+    table.cell(perfTable, 0, lastRow, "Total",             text_color = color.white)
+    table.cell(perfTable, 1, lastRow, str.tostring(totTrades), text_color = color.white)
+    table.cell(perfTable, 2, lastRow, str.tostring(totTP1),    text_color = color.white)
+    table.cell(perfTable, 3, lastRow, str.tostring(totTP2),    text_color = color.white)
+    table.cell(perfTable, 4, lastRow, str.tostring(totSL),     text_color = color.white)
+    table.cell(perfTable, 5, lastRow, totWr,                   text_color = color.white)
 
 alertcondition(przActiveThisBar, title = "PRZ Active", message = "Price entered a harmonic PRZ zone on {{ticker}} {{interval}}")
 
