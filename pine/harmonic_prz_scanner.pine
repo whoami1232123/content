@@ -57,6 +57,14 @@
 // ============================================================================
 
 //@version=6
+// Commission/slippage are fixed defaults here rather than script inputs — the
+// strategy() declaration statement must be the first statement in the script,
+// so it cannot reference input.*() variables declared elsewhere, and inlining
+// input.*() calls as its own argument values is unreliable across Pine Editor
+// versions. Override both from the chart's "Properties" tab -> "Commission
+// and slippage" instead (PRD §7.2, §11.5 step 3 — do this before drawing ANY
+// conclusion from the Strategy Tester; these defaults are deliberately non-zero
+// so a fresh load isn't silently flattered, but they are still only a guess).
 strategy("Harmonic PRZ Matrix — Gartley/Bat/Butterfly/Crab",
     shorttitle = "Harmonic PRZ",
     overlay = true,
@@ -67,8 +75,8 @@ strategy("Harmonic PRZ Matrix — Gartley/Bat/Butterfly/Crab",
     calc_on_every_tick = false,
     process_orders_on_close = true,
     commission_type = strategy.commission.percent,
-    commission_value = input.float(0.05, "Commission % per fill (§7.2, §11.5)", minval = 0.0, step = 0.01, group = "Backtest realism"),
-    slippage = input.int(2, "Slippage (ticks, §7.2, §11.5)", minval = 0, group = "Backtest realism"),
+    commission_value = 0.05,
+    slippage = 2,
     max_lines_count = 300, max_boxes_count = 300, max_labels_count = 300)
 
 // ---------------------------------------------------------------- Inputs ---
@@ -111,6 +119,13 @@ type PatternDef
     float  stopR
     color  col
 
+// ------------------------------------------------------------ Persisted ---
+// Declared before the helpers below, because a Pine function reading a global
+// var must see it declared earlier in the script — Pine does not hoist.
+var Pivot[]      zz       = array.new<Pivot>()
+var PatternDef[] defs     = array.new<PatternDef>()
+var int[]        lastSigC = array.new<int>()
+
 // -------------------------------------------------------------- Helpers ---
 inWindow(float val, float lo, float hi, float tol) =>
     val >= lo - tol and val <= hi + tol
@@ -133,11 +148,6 @@ addPivot(float price, int idx, bool isHigh) =>
             array.push(zz, Pivot.new(price, idx, isHigh))
     if array.size(zz) > maxPivots
         array.shift(zz)
-
-// ------------------------------------------------------------ Persisted ---
-var Pivot[]      zz      = array.new<Pivot>()
-var PatternDef[] defs    = array.new<PatternDef>()
-var int[]        lastSigC = array.new<int>()
 
 if barstate.isfirst
     if useGartley
